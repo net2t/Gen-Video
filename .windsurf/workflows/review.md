@@ -2,21 +2,48 @@
 auto_execution_mode: 0
 description: Review code changes for bugs, security issues, and improvements
 ---
-You are a senior software engineer performing a thorough code review to identify potential bugs.
+# Code Review Workflow
 
-Your task is to find all potential bugs and code improvements in the code changes. Focus on:
-1. Logic errors and incorrect behavior
-2. Edge cases that aren't handled
-3. Null/undefined reference issues
-4. Race conditions or concurrency issues
-5. Security vulnerabilities
-6. Improper resource management or resource leaks
-7. API contract violations
-8. Incorrect caching behavior, including cache staleness issues, cache key-related bugs, incorrect cache invalidation, and ineffective caching
-9. Violations of existing code patterns or conventions
+## Global Rules for VideoProcessor Project
 
-Make sure to:
-1. If exploring the codebase, call multiple tools in parallel for increased efficiency. Do not spend too much time exploring.
-2. If you find any pre-existing bugs in the code, you should also report those since it's important for us to maintain general code quality for the user.
-3. Do NOT report issues that are speculative or low-confidence. All your conclusions should be based on a complete understanding of the codebase.
-4. Remember that if you were given a specific git commit, it may not be checked out and local code states may be different.
+### 🔄 **Auto-Push Rules**
+- **Always push** after any meaningful code changes
+- **Commit format**: Use conventional commits (feat:, fix:, docs:, etc.)
+- **Auto-sync**: Push to origin immediately after commit
+- **Branch protection**: Main branch requires clean status
+
+### 📋 **Review Checklist**
+1. **Functionality**: Does the code work as expected?
+2. **Security**: Are credentials and sensitive data protected?
+3. **Performance**: Is FFmpeg processing efficient?
+4. **Error Handling**: Are edge cases properly handled?
+5. **Documentation**: Is README.md up to date?
+
+### 🚫 **Never Commit**
+- `.env` files (contains secrets)
+- `auth.json` (OAuth credentials)
+- `token.json` (OAuth tokens)
+- `credentials.json` (service account keys)
+- Log files
+- Temporary files
+
+### ✅ **Always Include**
+- Code changes with proper commit messages
+- Updated documentation
+- Test results (if applicable)
+
+### 🎯 **Project-Specific Rules**
+- FFmpeg commands must be tested before pushing
+- OAuth authentication must be working
+- Assets folder paths must be correct
+- GitHub Actions workflow must be valid
+
+## Review Process
+
+1. **Analyze changes** for bugs and improvements
+2. **Check security** of credential handling
+3. **Verify functionality** with test runs
+4. **Update documentation** if needed
+5. **Push changes** with proper commit message
+
+This workflow ensures code quality and maintains project stability.
