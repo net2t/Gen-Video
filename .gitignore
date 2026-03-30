@@ -33,3 +33,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# Windsurf IDE configuration (local only)
+.windsurf/
