@@ -1,0 +1,10 @@
+# VideoProcessor — Python dependencies
+# Run: pip install -r requirements.txt
+
+gspread
+google-auth
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+requests
+python-dotenv

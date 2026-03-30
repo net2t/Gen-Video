@@ -1,0 +1,160 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║   VideoProcessor — GitHub Actions Workflow                      ║
+# ║                                                                  ║
+# ║   Triggers:                                                      ║
+# ║     • Scheduled : daily at 08:00 UTC (1:00 PM Pakistan)        ║
+# ║     • Manual    : Actions tab → Run workflow → any browser      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+name: 🎬 Process Videos
+
+on:
+  schedule:
+    # 08:00 UTC = 1:00 PM Pakistan Standard Time (UTC+5)
+    # Change this to your preferred time. Format: minute hour day month weekday
+    # More examples:
+    #   "0 3 * * *"   = 8:00 AM Pakistan
+    #   "0 15 * * *"  = 8:00 PM Pakistan
+    #   "0 8 * * 1-5" = Weekdays only at 1:00 PM Pakistan
+    - cron: "0 8 * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: false
+        default: "cloud"
+        type: choice
+        options:
+          - cloud
+      dry_run:
+        description: "Dry run? (scan only — no changes)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      max_videos:
+        description: "Max videos to process (blank = all)"
+        required: false
+        default: ""
+      trim_seconds:
+        description: "Seconds to trim from end"
+        required: false
+        default: "4"
+      logo_x:
+        description: "Logo X position (pixels from left)"
+        required: false
+        default: "10"
+      logo_y:
+        description: "Logo Y position (pixels from top)"
+        required: false
+        default: "10"
+      logo_width:
+        description: "Logo width in pixels"
+        required: false
+        default: "120"
+
+jobs:
+  process:
+    name: 🎬 Logo + Trim + Upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hour max (GitHub Actions limit)
+
+    steps:
+
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            gspread \
+            google-auth \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib \
+            requests \
+            python-dotenv
+
+      - name: 🔧 Verify FFmpeg
+        run: |
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+          echo "✅ FFmpeg ready"
+
+      - name: 🔐 Write credentials from secret
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+          echo "✅ credentials.json ready ($(wc -c < credentials.json) bytes)"
+
+      - name: ⚙️ Write .env config
+        run: |
+          TRIM="${{ github.event.inputs.trim_seconds }}"
+          LX="${{ github.event.inputs.logo_x }}"
+          LY="${{ github.event.inputs.logo_y }}"
+          LW="${{ github.event.inputs.logo_width }}"
+          cat > .env << EOF
+          SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_DRIVE_FOLDER_ID=${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          TRIM_SECONDS=${TRIM:-4}
+          LOGO_PATH=logo.png
+          LOGO_X=${LX:-10}
+          LOGO_Y=${LY:-10}
+          LOGO_WIDTH=${LW:-120}
+          LOGO_OPACITY=1.0
+          EOF
+          echo "✅ .env ready"
+
+      - name: 🔍 Dry run — preview what will be processed
+        run: python process.py --mode cloud --dry-run
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
+      - name: 🎬 Process videos (cloud mode)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          CMD="python process.py --mode cloud"
+          MAX="${{ github.event.inputs.max_videos }}"
+          [ -n "$MAX" ] && CMD="$CMD --max $MAX"
+          echo "Command: $CMD"
+          $CMD
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
+      - name: 🔍 Dry run only (if selected)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "⚠️ DRY RUN — no videos processed"
+          python process.py --mode cloud --dry-run
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
+      - name: 🧹 Clean up secrets
+        if: always()
+        run: rm -f credentials.json .env
+
+      - name: 📊 Summary
+        if: always()
+        run: |
+          echo "## 🎬 VideoProcessor Run" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trim seconds | ${{ github.event.inputs.trim_seconds || '4' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry run | ${{ github.event.inputs.dry_run || 'false' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runner OS | ubuntu-latest |" >> $GITHUB_STEP_SUMMARY
