@@ -58,7 +58,7 @@ SHEETS_SCOPES = ["https://spreadsheets.google.com/feeds",
 DRIVE_SCOPES  = ["https://www.googleapis.com/auth/drive"]
 
 # ── Sheet Names ───────────────────────────────────────────────────────────────
-VIDEO_SHEET_NAME = "VideoData"  # Your main video sheet
+VIDEO_SHEET_NAME = "VideoData"  # Your main video sheet - will try first
 ACCOUNTS_SHEET_NAME = "Accounts"  # Multi-account credentials sheet
 
 # ── Accounts Sheet Columns ─────────────────────────────────────────────────────
@@ -115,7 +115,22 @@ def get_sheet():
     try:
         creds  = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SHEETS_SCOPES)
         client = gspread.authorize(creds)
-        return client.open_by_key(SPREADSHEET_ID).worksheet(VIDEO_SHEET_NAME)
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        
+        # Try to find the video data sheet
+        try:
+            return spreadsheet.worksheet(VIDEO_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            # Try common sheet names
+            for name in ["Sheet1", "Video Data", "Videos", "Data", "Stories"]:
+                try:
+                    return spreadsheet.worksheet(name)
+                except gspread.exceptions.WorksheetNotFound:
+                    continue
+            
+            # If none found, use the first sheet
+            return spreadsheet.get_worksheet(0)
+            
     except Exception as e:
         print(f"[ERROR] Google Sheets: {e}")
         return None
@@ -1248,36 +1263,59 @@ def get_next_account(sheet_service, spreadsheet_id):
     """Get the best account to use based on usage and status"""
     try:
         # Get accounts sheet
-        accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+        try:
+            accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+            print(f"[Accounts] Found '{ACCOUNTS_SHEET_NAME}' sheet")
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"[ERROR] Accounts sheet '{ACCOUNTS_SHEET_NAME}' not found!")
+            print("[ERROR] Please create a sheet named 'Accounts' with columns:")
+            print("  A: Email, B: Password, C: Status, D: Daily Usage, E: Last Used, F: Total Generated")
+            return None
+            
         accounts = accounts_sheet.get_all_records()
+        print(f"[Accounts] Found {len(accounts)} accounts")
         
         current_date = datetime.now().strftime("%Y-%m-%d")
         best_account = None
         lowest_usage = 999
         
-        for account in accounts:
-            status = account.get('Status', '').strip()
-            daily_use = int(account.get('Daily Usage', 0))
-            last_used = account.get('Last Used', '').strip()
+        for i, account in enumerate(accounts):
+            # Try different column name variations
+            status = account.get('Status', '').strip() or account.get('status', '').strip() or account.get('Active', '').strip()
+            daily_use = int(account.get('Daily Usage', 0) or account.get('Daily Usage', 0) or account.get('Usage', 0) or 0)
+            last_used = account.get('Last Used', '').strip() or account.get('Last Used', '').strip() or account.get('Date', '').strip()
+            email = account.get('Email', '').strip() or account.get('email', '').strip() or account.get('Account', '').strip()
+            
+            # If status is empty, assume it's active (for initial setup)
+            if not status:
+                status = 'active'
+                print(f"[Accounts] Assuming {email} is active (status was empty)")
+            
+            print(f"[Accounts] Account {i+1}: {email} | Status: {status} | Usage: {daily_use}")
             
             # Skip if not active
             if status.lower() != 'active':
+                print(f"[Accounts] Skipping {email} - status not active")
                 continue
                 
             # Reset daily usage if it's a new day
             if last_used != current_date:
                 daily_use = 0
+                print(f"[Accounts] Reset usage for {email} - new day")
                 
             # Find account with lowest usage
             if daily_use < lowest_usage and daily_use < 5:
                 lowest_usage = daily_use
                 best_account = account
+                print(f"[Accounts] Best account so far: {email} with usage {daily_use}")
         
         if best_account:
             # Update usage for selected account
             row_num = accounts.index(best_account) + 2  # +2 for header + 1-based
             accounts_sheet.update_cell(row_num, ACCOL_DAILY_USE, lowest_usage + 1)
             accounts_sheet.update_cell(row_num, ACCOL_LAST_USED, current_date)
+            
+            print(f"[Accounts] Selected: {best_account.get('Email')} (usage: {lowest_usage}→{lowest_usage+1})")
             
             return {
                 'email': best_account.get('Email', ''),
@@ -1290,6 +1328,8 @@ def get_next_account(sheet_service, spreadsheet_id):
             
     except Exception as e:
         print(f"[ERROR] Failed to get account: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def update_account_success(sheet_service, spreadsheet_id, account_row, success=True):
@@ -1421,23 +1461,39 @@ def main():
                 print(f"\n[SHUTDOWN] Stopping after {processed} stories.")
                 break
             if processed >= limit:
-                print(f"\n[Limit] Reached {limit} stories. Stopping.")
+                print(f"\n[LIMIT] Reached limit of {limit} stories.")
                 break
-
-            status = row.get("Status", "").strip().lower()
-
+            
+            # Get status from the row using multiple possible column names
+            status = ""
+            if 'Status' in row:
+                status = row['Status'].strip().lower()
+            elif 'status' in row:
+                status = row['status'].strip().lower()
+            elif 'E' in row:  # Column E
+                status = row['E'].strip().lower()
+            
+            print(f"[Row {idx}] Status: '{status}'")
+            print(f"[Row {idx}] Full row data: {dict(row)}")
+            
             # ── Only process stories with "Generated" status ────────────────────────────
             if status != "generated":
+                print(f"[Row {idx}] Skipping - status not 'generated'")
                 continue
 
             # ── Check for pending retry (has a Project URL saved) ─────────────
             project_url = str(row.get("Project URL", "") or "").strip()
-            story       = row.get("Story", "").strip()
+            story       = row.get("Story Text", "").strip() or row.get("Story", "").strip()
+            
+            print(f"[Row {idx}] Story: '{story[:50]}...' | Project URL: '{project_url}'")
+            
             if not story:
+                print(f"[Row {idx}] Skipping - no story content")
                 continue
 
-            title_hint = (row.get("Title", "") or f"Row_{idx}").strip() or f"Row_{idx}"
+            title_hint = (row.get("Story Title", "") or row.get("Title", "") or f"Row_{idx}").strip() or f"Row_{idx}"
             moral      = row.get("Moral", "").strip()
+            hashtags   = row.get("Hashtags", "").strip()
 
             # Build a filesystem-safe folder name
             safe_title = f"Row_{idx}_{title_hint[:40]}".replace(" ", "_") \
