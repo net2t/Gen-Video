@@ -12,6 +12,7 @@ import signal
 import argparse
 import requests
 import gspread
+import traceback
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from playwright.sync_api import sync_playwright, Download
@@ -28,7 +29,11 @@ except ImportError:
     _OAUTH_LIB_OK = False
 
 # ── Load config ───────────────────────────────────────────────────────────────
-load_dotenv()
+_DOTENV_PATH = os.getenv("DOTENV_PATH", "").strip() or None
+if _DOTENV_PATH:
+    load_dotenv(dotenv_path=_DOTENV_PATH)
+else:
+    load_dotenv()
 
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID", "")
 ML_EMAIL        = os.getenv("ML_EMAIL", "")
@@ -45,11 +50,11 @@ STEP4_RENDER_TIMEOUT = int(os.getenv("STEP4_RENDER_TIMEOUT", "900"))  # seconds 
 STEP4_POLL_INTERVAL  = int(os.getenv("STEP4_POLL_INTERVAL",  "15"))   # how often to check render status
 STEP4_MAX_NEXT       = int(os.getenv("STEP4_MAX_NEXT",       "10"))   # max Next clicks before reaching Generate
 
-CREDS_FILE        = "credentials.json"
-OAUTH_CREDS_FILE  = "oauth_credentials.json"
-OAUTH_TOKEN_FILE  = "token.json"
-COOKIES_FILE      = "cookies.json"
-DOWNLOADS_DIR     = os.path.join(os.path.dirname(__file__), "downloads")
+CREDS_FILE        = os.getenv("CREDS_FILE", "credentials.json")
+OAUTH_CREDS_FILE  = os.getenv("OAUTH_CREDS_FILE", "oauth_credentials.json")
+OAUTH_TOKEN_FILE  = os.getenv("OAUTH_TOKEN_FILE", "token.json")
+COOKIES_FILE      = os.getenv("COOKIES_FILE", "cookies.json")
+DOWNLOADS_DIR     = os.getenv("DOWNLOADS_DIR", "").strip() or os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # ── Google API scopes ─────────────────────────────────────────────────────────
@@ -68,6 +73,7 @@ ACCOL_STATUS     = 3  # C - Status (Active/Cooldown/Banned)
 ACCOL_DAILY_USE  = 4  # D - Daily Usage (0-5)
 ACCOL_LAST_USED  = 5  # E - Last Used Timestamp
 ACCOL_TOTAL_GEN  = 6  # F - Total Videos Generated
+ACCOL_CREDITS    = 7  # G - Current Credit Balance
 
 # ── Sheet column indices (1-based) ────────────────────────────────────────────
 COL_TITLE       = 1  # A - Story Title
@@ -79,6 +85,15 @@ COL_THUMB_URL   = 6  # F - Thumbnail URL
 COL_NOTES       = 7  # G - Notes
 COL_PROJECT_URL = 8  # H - Project URL
 COL_PROCESSED   = 9  # I - Processed Video URL
+
+# ── Optional generated metadata columns (only used if present in your sheet) ──
+# Some older versions of this script wrote extra metadata (video_id, gen_title,
+# summary, hashtags). If your sheet does not have these columns, keep them
+# mapped to safe existing columns to avoid crashes.
+COL_VIDEO_ID    = int(os.getenv("COL_VIDEO_ID", str(COL_PROJECT_URL)))
+COL_GEN_TITLE   = int(os.getenv("COL_GEN_TITLE", str(COL_TITLE)))
+COL_SUMMARY     = int(os.getenv("COL_SUMMARY", str(COL_NOTES)))
+COL_GEN_HASH    = int(os.getenv("COL_GEN_HASH", str(COL_HASHTAGS)))
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 shutdown_requested = False
@@ -101,6 +116,8 @@ signal.signal(signal.SIGINT, signal_handler)
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="AutoMagicAI — Kids Story video generator")
+    p.add_argument("--mode", choices=["generate", "process"], default="generate",
+                   help="Operation mode: generate (create videos) or process (add logo/endscreen)")
     p.add_argument("--maxstory", "-n", type=int, default=None,
                    help="Stories to process (overrides .env STORIES_PER_RUN)")
     p.add_argument("--headless", action="store_true", default=None,
@@ -111,29 +128,40 @@ def parse_args():
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
-def get_sheet():
-    try:
-        creds  = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SHEETS_SCOPES)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        
-        # Try to find the video data sheet
+def get_sheet_with_retry(max_retries=3):
+    """Get sheet with retry logic for API errors"""
+    for attempt in range(max_retries):
         try:
-            return spreadsheet.worksheet(VIDEO_SHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            # Try common sheet names
-            for name in ["Sheet1", "Video Data", "Videos", "Data", "Stories"]:
-                try:
-                    return spreadsheet.worksheet(name)
-                except gspread.exceptions.WorksheetNotFound:
-                    continue
+            creds  = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SHEETS_SCOPES)
+            client = gspread.authorize(creds)
+            spreadsheet = client.open_by_key(SPREADSHEET_ID)
             
-            # If none found, use the first sheet
-            return spreadsheet.get_worksheet(0)
-            
-    except Exception as e:
-        print(f"[ERROR] Google Sheets: {e}")
-        return None
+            # Try to find the video data sheet
+            try:
+                return spreadsheet.worksheet(VIDEO_SHEET_NAME)
+            except gspread.exceptions.WorksheetNotFound:
+                # Try common sheet names
+                for name in ["Sheet1", "Video Data", "Videos", "Data", "Stories"]:
+                    try:
+                        return spreadsheet.worksheet(name)
+                    except gspread.exceptions.WorksheetNotFound:
+                        continue
+                
+                # If none found, use the first sheet
+                return spreadsheet.get_worksheet(0)
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                print(f"[Sheets] API Error (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"[Sheets] Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"[ERROR] Google Sheets: {e}")
+                return None
+
+def get_sheet():
+    return get_sheet_with_retry()
 
 def get_sheet_service():
     """Get sheet service for multi-account management"""
@@ -234,6 +262,114 @@ def clear_cookies():
         os.remove(COOKIES_FILE)
         print("[Cookies] Cleared stale cookies.json")
 
+
+def get_credit_balance(page):
+    """Get current credit balance from MagicLight.AI dashboard"""
+    try:
+        credit_element = page.locator(".home-top-navbar-credit-amount")
+        if credit_element.count() > 0:
+            credit_text = credit_element.inner_text().strip()
+            credits = int(credit_text)
+            print(f"[Credits] Current balance: {credits}")
+            return credits
+        else:
+            print("[Credits] Credit element not found")
+            return 0
+    except Exception as e:
+        print(f"[Credits] Error reading balance: {e}")
+        return 0
+
+def has_enough_credits(credits):
+    """Check if there are enough credits for video generation (60 credits per video)"""
+    needed = 60
+    return credits >= needed
+
+def detect_account_type(page):
+    """Detect if account is fresh or has credit card bound"""
+    try:
+        # Look for credit card UI elements or premium indicators
+        selectors = [
+            ".billing-credit-card",
+            ".premium-badge", 
+            ".subscription-status",
+            "[data-testid='credit-card-section']",
+            ".payment-method",
+            ".account-premium",
+            "text='Premium'",
+            "text='Subscription'",
+            "text='Payment Method'"
+        ]
+        
+        for selector in selectors:
+            element = page.locator(selector)
+            if element.count() > 0 and element.first.is_visible():
+                print(f"[Account] Detected premium account via: {selector}")
+                return "premium"
+        
+        # Check for higher credit amounts (indicating premium)
+        credits = get_credit_balance(page)
+        if credits >= 1000:  # Threshold for premium accounts
+            print(f"[Account] Detected premium account via credit amount: {credits}")
+            return "premium"
+        
+        print("[Account] Detected fresh account (no premium indicators)")
+        return "fresh"
+        
+    except Exception as e:
+        print(f"[Account] Error detecting account type: {e}")
+        return "unknown"
+
+def get_expected_credits(account_type):
+    """Get expected credit balance based on account type"""
+    if account_type == "premium":
+        return 1200  # Premium accounts with credit card
+    elif account_type == "fresh":
+        return 300   # Fresh accounts
+    else:
+        return 300   # Default assumption
+
+def validate_credit_system(page):
+    """Comprehensive credit system validation"""
+    print("\n" + "="*60)
+    print("🔍 CREDIT SYSTEM VALIDATION")
+    print("="*60)
+    
+    # Get current credit balance
+    current_credits = get_credit_balance(page)
+    
+    # Detect account type
+    account_type = detect_account_type(page)
+    expected_credits = get_expected_credits(account_type)
+    
+    print(f"[Account] Type: {account_type.upper()}")
+    print(f"[Credits] Current Balance: {current_credits}")
+    print(f"[Credits] Expected Balance: {expected_credits}")
+    print(f"[Credits] Cost per Generation: 60")
+    
+    # Calculate how many generations possible
+    possible_generations = current_credits // 60
+    print(f"[Credits] Possible Generations: {possible_generations}")
+    
+    # Validate if credits match expected range
+    if account_type == "premium":
+        if current_credits < 1000:
+            print(f"[⚠️  WARNING] Premium account has lower credits than expected")
+        else:
+            print(f"[✅] Premium account credit level looks good")
+    elif account_type == "fresh":
+        if current_credits < 250:
+            print(f"[⚠️  WARNING] Fresh account has lower credits than expected")
+        else:
+            print(f"[✅] Fresh account credit level looks good")
+    
+    # Check if enough for generation
+    if has_enough_credits(current_credits):
+        print(f"[✅] Sufficient credits for video generation")
+        return True
+    else:
+        print(f"[❌] INSUFFICIENT CREDITS for video generation")
+        print(f"[❌] Need 60 credits, have {current_credits}")
+        return False
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 def login(page, email, password):
@@ -527,17 +663,22 @@ def _click_next_step1(page, timeout: int = 30) -> bool:
 def _click_next_header(page):
     """Click the header-shiny-action__btn Next div and dismiss any animation modal."""
     js = """() => {
+        const blocked = ['Buy Now','Upgrade','Subscribe','Pricing','View More'];
+        const isBlocked = (el) => {
+            const t = (el.innerText || el.textContent || '').trim();
+            return blocked.some(b => t === b || t.includes(b));
+        };
         const divs = Array.from(document.querySelectorAll('[class*="header-shiny-action__btn"]'));
         for (const el of divs) {
             const t = (el.innerText || '').trim();
             const r = el.getBoundingClientRect();
-            if (t === 'Next' && r.width > 0 && r.height > 0) { el.click(); return 'header Next'; }
+            if (t === 'Next' && r.width > 0 && r.height > 0 && !isBlocked(el)) { el.click(); return 'header Next'; }
         }
         const btns = Array.from(document.querySelectorAll('button.arco-btn-primary, button'));
         for (const el of btns) {
             const t = (el.innerText || '').trim();
             const r = el.getBoundingClientRect();
-            if (t === 'Next' && r.width > 0 && r.height > 0) { el.click(); return 'button Next'; }
+            if (t === 'Next' && r.width > 0 && r.height > 0 && !isBlocked(el)) { el.click(); return 'button Next'; }
         }
         return null;
     }"""
@@ -634,13 +775,372 @@ def _open_dropdown_and_select(page, label_text: str, option_text: str) -> bool:
         return False
 
 
+def handle_all_popups(page):
+    """Handle all types of pop-ups that might appear"""
+    print("[Popup] Checking for all pop-ups...")
+    
+    popups_handled = 0
+    
+    # 1. Handle "Extra Discount For Linking A Card" popup
+    try:
+        popup_selector = "text=Extra Discount For Linking A Card"
+        if page.locator(popup_selector).is_visible(timeout=3000):
+            print("[Popup] Found 'Extra Discount' popup - closing it")
+            # Try multiple close button selectors
+            close_selectors = [
+                "button.close",                    # Bootstrap close button
+                ".modal-header .close",            # Modal header close
+                ".modal-content .close",           # Modal content close
+                "[aria-label='Close']",            # Accessibility close
+                ".btn-close",                      # Modern Bootstrap
+                "text='×'",                        # X symbol
+                "button:has-text('×')"             # Button with X
+            ]
+            
+            for selector in close_selectors:
+                try:
+                    if page.locator(selector).is_visible(timeout=1000):
+                        page.locator(selector).click(timeout=2000)
+                        print(f"[Popup] Closed discount popup with: {selector}")
+                        popups_handled += 1
+                        time.sleep(1)
+                        break
+                except:
+                    continue
+            
+            # If clicking fails, try ESC key
+            if page.locator(popup_selector).is_visible(timeout=1000):
+                page.keyboard.press("Escape")
+                print("[Popup] Closed discount popup with ESC key")
+                popups_handled += 1
+                time.sleep(1)
+                
+    except Exception as e:
+        print(f"[Popup] Error handling discount popup: {e}")
+    
+    # 2. Handle "Double Check" promotion popup
+    try:
+        promo_selectors = [
+            "text=Double Check",
+            "text=Promotion", 
+            "text=Last Day",
+            "text=Limited Time"
+        ]
+        
+        for promo_text in promo_selectors:
+            if page.locator(f"text={promo_text}").is_visible(timeout=2000):
+                print(f"[Popup] Found promotion popup: {promo_text}")
+                
+                # Try to close it with X button
+                close_selectors = [
+                    "button.close",
+                    ".modal-header .close", 
+                    ".btn-close",
+                    "text='×'",
+                    "button:has-text('×')"
+                ]
+                
+                for selector in close_selectors:
+                    try:
+                        if page.locator(selector).is_visible(timeout=1000):
+                            page.locator(selector).click(timeout=2000)
+                            print(f"[Popup] Closed promotion popup with: {selector}")
+                            popups_handled += 1
+                            time.sleep(1)
+                            break
+                    except:
+                        continue
+                
+                # If still there, try ESC
+                if page.locator(f"text={promo_text}").is_visible(timeout=1000):
+                    page.keyboard.press("Escape")
+                    print(f"[Popup] Closed promotion popup with ESC")
+                    popups_handled += 1
+                    time.sleep(1)
+                    
+    except Exception as e:
+        print(f"[Popup] Error handling promotion popup: {e}")
+    
+    # 3. Handle tutorial overlays
+    try:
+        tour_selectors = [
+            ".introjs-tooltipReferenceLayer",
+            ".tour-overlay",
+            "text=Skip Tour",
+            "text=Got it", 
+            "text=Skip"
+        ]
+        
+        for selector in tour_selectors:
+            if page.locator(selector).is_visible(timeout=2000):
+                print(f"[Popup] Found tutorial overlay - closing")
+                try:
+                    page.locator(selector).click(timeout=2000)
+                except:
+                    page.keyboard.press("Escape")
+                popups_handled += 1
+                time.sleep(1)
+                break
+                
+    except Exception as e:
+        print(f"[Popup] Error handling tutorial: {e}")
+    
+    print(f"[Popup] Handled {popups_handled} pop-up(s)")
+    return popups_handled > 0
+
+def debug_dom_structure(page, description="DOM Debug"):
+    """Comprehensive DOM analysis to see exactly what's on the page"""
+    print(f"\n{'='*60}")
+    print(f"🔍 {description} - DOM ANALYSIS")
+    print(f"{'='*60}")
+    
+    try:
+        # Get current URL
+        current_url = page.url
+        print(f"📍 Current URL: {current_url}")
+        
+        # Get page title
+        title = page.title()
+        print(f"📄 Page Title: {title}")
+        
+        # Check for visible pop-ups/modals
+        print("\n🪟 CHECKING FOR VISIBLE POP-UPS/MODALS:")
+        popup_selectors = [
+            ".modal",
+            ".modal-dialog", 
+            ".modal-content",
+            ".popup",
+            ".overlay",
+            "[role='dialog']",
+            ".introjs-tooltipReferenceLayer",
+            ".tour-overlay"
+        ]
+        
+        found_popups = []
+        for selector in popup_selectors:
+            elements = page.locator(selector)
+            count = elements.count()
+            if count > 0:
+                print(f"  ✅ Found {count} element(s) with selector: {selector}")
+                found_popups.append(selector)
+                
+                # Get details about each popup
+                for i in range(min(count, 3)):  # Max 3 to avoid spam
+                    element = elements.nth(i)
+                    try:
+                        if element.is_visible():
+                            text_content = element.inner_text().strip()[:100]
+                            print(f"    - Element {i+1}: Visible, Text: '{text_content}'")
+                            
+                            # Find close buttons within this popup
+                            close_buttons = element.locator("button, [aria-label='Close'], .close")
+                            close_count = close_buttons.count()
+                            if close_count > 0:
+                                print(f"      🔘 Found {close_count} close button(s) inside")
+                    except:
+                        print(f"    - Element {i+1}: Not visible or error")
+        
+        if not found_popups:
+            print("  ❌ No visible pop-ups/modals found")
+        
+        # Check for specific text content that might indicate pop-ups
+        print("\n📝 CHECKING FOR SPECIFIC POP-UP TEXT:")
+        popup_texts = [
+            "Extra Discount",
+            "Double Check", 
+            "Promotion",
+            "Last Day",
+            "Limited Time",
+            "Linking A Card",
+            "Skip Tour",
+            "Got it"
+        ]
+        
+        for text in popup_texts:
+            elements = page.locator(f"text={text}")
+            count = elements.count()
+            if count > 0:
+                print(f"  ✅ Found text '{text}' ({count} occurrence(s))")
+                for i in range(min(count, 2)):
+                    try:
+                        element = elements.nth(i)
+                        if element.is_visible():
+                            print(f"    - Occurrence {i+1}: VISIBLE")
+                        else:
+                            print(f"    - Occurrence {i+1}: Hidden")
+                    except:
+                        print(f"    - Occurrence {i+1}: Error checking")
+        
+        # Check for clickable elements (buttons, links)
+        print("\n🔘 CHECKING FOR CLICKABLE ELEMENTS:")
+        clickable_selectors = [
+            "button",
+            "a[href]", 
+            ".btn",
+            "[role='button']",
+            "input[type='button']",
+            "input[type='submit']"
+        ]
+        
+        total_clickable = 0
+        for selector in clickable_selectors:
+            elements = page.locator(selector)
+            count = elements.count()
+            if count > 0:
+                total_clickable += count
+                visible_count = 0
+                for i in range(min(count, 5)):  # Check first 5
+                    try:
+                        if elements.nth(i).is_visible():
+                            visible_count += 1
+                            text = elements.nth(i).inner_text().strip()[:30]
+                            if text:
+                                print(f"    🔘 {selector}: '{text}' (visible)")
+                            else:
+                                print(f"    🔘 {selector}: [no text] (visible)")
+                    except:
+                        pass
+                
+                if visible_count < count:
+                    print(f"    📊 {selector}: {visible_count} visible, {count - visible_count} hidden")
+        
+        print(f"\n📊 Total clickable elements found: {total_clickable}")
+        
+        # Check for specific step-related elements
+        print("\n🎯 CHECKING FOR STEP-SPECIFIC ELEMENTS:")
+        step_selectors = [
+            ".step2-footer-btn-left",
+            ".step2-footer", 
+            "button:has-text('Next')",
+            "button:has-text('Next Step')",
+            "button:has-text('Animate')",
+            "button:has-text('Create')",
+            "[class*='step2']",
+            "[class*='footer']"
+        ]
+        
+        for selector in step_selectors:
+            elements = page.locator(selector)
+            count = elements.count()
+            if count > 0:
+                print(f"  ✅ Found {count} element(s) with selector: {selector}")
+                for i in range(min(count, 2)):
+                    try:
+                        element = elements.nth(i)
+                        is_visible = element.is_visible()
+                        text = element.inner_text().strip()[:50]
+                        print(f"    - Element {i+1}: Visible={is_visible}, Text='{text}'")
+                        
+                        # Get bounding box for positioning
+                        if is_visible:
+                            box = element.bounding_box()
+                            if box:
+                                print(f"      📍 Position: x={box['x']}, y={box['y']}, w={box['width']}, h={box['height']}")
+                    except Exception as e:
+                        print(f"    - Element {i+1}: Error - {e}")
+            else:
+                print(f"  ❌ No elements found with selector: {selector}")
+        
+        # Take screenshot for visual reference
+        try:
+            screenshot_path = f"debug_screenshot_{int(time.time())}.png"
+            page.screenshot(path=screenshot_path, full_page=False)
+            print(f"\n📸 Screenshot saved: {screenshot_path}")
+        except Exception as e:
+            print(f"\n📸 Screenshot failed: {e}")
+        
+    except Exception as e:
+        print(f"❌ DOM analysis failed: {e}")
+    
+    print(f"{'='*60}\n")
+
+def smart_click_element(page, description, selectors, timeout=10000):
+    """Smart clicking that tries multiple selectors and provides detailed feedback"""
+    print(f"\n🎯 {description}")
+    
+    for i, selector in enumerate(selectors):
+        print(f"  Attempt {i+1}: Trying selector '{selector}'")
+        
+        try:
+            element = page.locator(selector)
+            
+            # Wait for element
+            if element.wait_for(state="visible", timeout=timeout//2):
+                print(f"    ✅ Element is visible")
+                
+                # Check if it's actually clickable
+                bounding_box = element.bounding_box()
+                if bounding_box and bounding_box['width'] > 0 and bounding_box['height'] > 0:
+                    print(f"    📐 Element has valid size: {bounding_box['width']}x{bounding_box['height']}")
+                    
+                    # Try clicking
+                    element.click(timeout=timeout//2)
+                    print(f"    🎉 SUCCESS: Clicked {selector}")
+                    time.sleep(1)  # Wait for any response
+                    return True
+                else:
+                    print(f"    ❌ Element has invalid size: {bounding_box}")
+            else:
+                print(f"    ❌ Element not visible within timeout")
+                
+        except Exception as e:
+            print(f"    ❌ Failed to click {selector}: {e}")
+    
+    print(f"    💥 ALL ATTEMPTS FAILED for {description}")
+    return False
+
+def wait_for_page_ready(page, timeout=30):
+    """Wait for page to be fully ready and pop-up free"""
+    print("[Ready] Waiting for page to be ready...")
+    
+    for i in range(timeout):
+        # Handle any pop-ups that appear
+        handle_all_popups(page)
+        
+        # Check if page is stable (no loading indicators)
+        loading_selectors = [
+            ".loading",
+            ".spinner", 
+            "text=Loading",
+            "text=Processing"
+        ]
+        
+        page_stable = True
+        for selector in loading_selectors:
+            try:
+                # Use .first() to avoid strict mode violations with multiple elements
+                elements = page.locator(selector)
+                if elements.count() > 0:
+                    # Check if ANY loading element is visible
+                    for j in range(elements.count()):
+                        if elements.nth(j).is_visible(timeout=1000):
+                            page_stable = False
+                            break
+            except Exception as e:
+                # If we can't check visibility, assume page is not ready
+                print(f"[Ready] Error checking {selector}: {e}")
+                page_stable = False
+                break
+        
+        if page_stable:
+            print(f"[Ready] Page is ready after {i+1} seconds")
+            return True
+            
+        time.sleep(1)
+    
+    print("[Ready] Page not ready after timeout, proceeding anyway")
+    return False
+
+
 def step1_content(page, story_text: str):
     print("[Step 1] Navigating to Kids Story page...")
     page.goto("https://magiclight.ai/kids-story/", timeout=60000)
     page.wait_for_load_state("domcontentloaded")
     time.sleep(6)
-    dismiss_popups(page)
-    _dismiss_tour(page)
+    
+    # Handle ALL pop-ups before proceeding
+    handle_all_popups(page)
+    wait_for_page_ready(page, timeout=15)
 
     print("[Step 1] Pasting story text...")
     textarea = page.locator("textarea[placeholder*='original story']")
@@ -698,14 +1198,40 @@ def step1_content(page, story_text: str):
 def step2_cast(page):
     print(f"[Step 2] Cast — waiting {STEP2_WAIT}s for characters to generate...")
     time.sleep(STEP2_WAIT)
-    dismiss_popups(page)
+    
+    # CRITICAL: Debug DOM before clicking Next
+    debug_dom_structure(page, "STEP 2 - BEFORE CLICKING NEXT")
+    
+    # Handle ALL pop-ups before clicking Next
+    print("[Step 2] Checking for pop-ups before clicking Next...")
+    handle_all_popups(page)
+    wait_for_page_ready(page, timeout=15)
+    
+    # Verify page is ready and no pop-ups remain
+    time.sleep(2)  # Extra wait to ensure stability
+    handle_all_popups(page)  # Double-check for pop-ups
 
     print("[Step 2] Clicking Next Step...")
-    if _dom_click_class(page, "step2-footer-btn-left", timeout=120):
+    
+    # Use smart clicking with detailed feedback
+    next_button_selectors = [
+        ".step2-footer-btn-left",
+        "button:has-text('Next Step')",
+        "button:has-text('Next')",
+        "button:has-text('Animate All')",
+        "button:has-text('Create now')",
+        ".step2-footer button",
+        "[class*='step2'][class*='btn']",
+        "[class*='footer'][class*='btn']"
+    ]
+    
+    success = smart_click_element(page, "STEP 2 - CLICKING NEXT BUTTON", next_button_selectors, timeout=30000)
+    
+    if success:
         print("[Step 2] ✓ Done.")
-    elif _dom_click_text(page, ["Next Step", "Animate All", "Create now"], timeout=30):
-        print("[Step 2] ✓ Done (fallback).")
     else:
+        print("[Step 2] ❌ Next Step button not found - debugging...")
+        debug_dom_structure(page, "STEP 2 - AFTER FAILED CLICK")
         _dom_debug_buttons(page)
         print("[Step 2] Next Step not found — may have auto-skipped.")
 
@@ -821,8 +1347,15 @@ def step3b_edit_settings(page):
 
 # ── Step 4: Edit → Generate → Wait → Download ─────────────────────────────────
 def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
+    import os  # Ensure os is available in this function
     print("[Step 4] Navigating sub-steps to reach Generate screen...")
     dismiss_popups(page)
+    try:
+        handle_all_popups(page)
+    except Exception:
+        pass
+
+    start_url = page.url
     time.sleep(3)
 
     generate_texts = ["Generate", "Create Video", "Export", "Create now", "Render"]
@@ -853,6 +1386,21 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
             }
             return null;
         }"""
+        try:
+            if "/project/edit/" in start_url and "/project/edit/" not in page.url:
+                print(f"[Step 4] ⚠️ Navigated away from project editor → {page.url}")
+                print(f"[Step 4] Recovering by going back to: {start_url}")
+                page.goto(start_url, timeout=60000)
+                page.wait_for_load_state("domcontentloaded")
+                time.sleep(4)
+        except Exception:
+            pass
+
+        try:
+            handle_all_popups(page)
+        except Exception:
+            pass
+
         found = page.evaluate(js_has_generate, generate_texts)
         if found:
             print(f"[Step 4] ✓ Found '{found}' button after {attempt} Next clicks!")
@@ -863,8 +1411,8 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
         if not result:
             print("[Step 4] No Next button found at all")
             _dom_debug_buttons(page)
-
-        time.sleep(4)   # Wait a bit longer after each Next click
+            time.sleep(3)
+        # Wait a bit longer after each Next click
         _dismiss_animation_modal(page)
         time.sleep(3)
         dismiss_popups(page)
@@ -1259,8 +1807,11 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
 
 
 # ── Multi-Account Management ─────────────────────────────────────────────────────
-def get_next_account(sheet_service, spreadsheet_id):
+def get_next_account(sheet_service, spreadsheet_id, exclude_accounts=None):
     """Get the best account to use based on usage and status"""
+    if exclude_accounts is None:
+        exclude_accounts = []
+        
     try:
         # Get accounts sheet
         try:
@@ -1283,28 +1834,35 @@ def get_next_account(sheet_service, spreadsheet_id):
             # Try different column name variations
             status = account.get('Status', '').strip() or account.get('status', '').strip() or account.get('Active', '').strip()
             daily_use = int(account.get('Daily Usage', 0) or account.get('Daily Usage', 0) or account.get('Usage', 0) or 0)
-            last_used = account.get('Last Used', '').strip() or account.get('Last Used', '').strip() or account.get('Date', '').strip()
-            email = account.get('Email', '').strip() or account.get('email', '').strip() or account.get('Account', '').strip()
+            email = account.get('Email', '').strip() or account.get('email', '').strip()
             
-            # If status is empty, assume it's active (for initial setup)
-            if not status:
-                status = 'active'
-                print(f"[Accounts] Assuming {email} is active (status was empty)")
-            
-            print(f"[Accounts] Account {i+1}: {email} | Status: {status} | Usage: {daily_use}")
-            
-            # Skip if not active
-            if status.lower() != 'active':
-                print(f"[Accounts] Skipping {email} - status not active")
+            # Skip excluded accounts
+            if email in exclude_accounts:
+                print(f"[Accounts] Skipping excluded account: {email}")
                 continue
                 
-            # Reset daily usage if it's a new day
-            if last_used != current_date:
-                daily_use = 0
-                print(f"[Accounts] Reset usage for {email} - new day")
+            # Skip inactive accounts
+            if status.lower() in ['banned', 'cooldown', 'low credits']:
+                print(f"[Accounts] Skipping inactive account: {email} (status: {status})")
+                continue
                 
-            # Find account with lowest usage
-            if daily_use < lowest_usage and daily_use < 5:
+            # Reset usage if it's a new day
+            last_used = account.get('Last Used', '').strip() or account.get('Last Used', '').strip()
+            if last_used != current_date:
+                print(f"[Accounts] Reset usage for {email} - new day")
+                row_num = i + 2  # +2 for header + 1-based
+                accounts_sheet.update_cell(row_num, ACCOL_DAILY_USE, 0)
+                accounts_sheet.update_cell(row_num, ACCOL_LAST_USED, current_date)
+                daily_use = 0
+                
+            # Consider credit balance if available
+            credits = int(account.get('Credits', 0) or account.get('credits', 0) or 0)
+            if credits > 0 and credits < 60:  # Skip accounts with known low credits
+                print(f"[Accounts] Skipping low credit account: {email} ({credits} credits)")
+                continue
+            
+            # Select account with lowest usage
+            if daily_use < lowest_usage:
                 lowest_usage = daily_use
                 best_account = account
                 print(f"[Accounts] Best account so far: {email} with usage {daily_use}")
@@ -1323,7 +1881,7 @@ def get_next_account(sheet_service, spreadsheet_id):
                 'row': row_num
             }
         else:
-            print("[ERROR] No available accounts found! All accounts have reached daily limit.")
+            print("[ERROR] No available accounts found! All accounts have reached daily limit or are excluded.")
             return None
             
     except Exception as e:
@@ -1348,24 +1906,150 @@ def update_account_success(sheet_service, spreadsheet_id, account_row, success=T
     except Exception as e:
         print(f"[ERROR] Failed to update account stats: {e}")
 
+def update_account_credits(sheet_service, spreadsheet_id, account_row, credits):
+    """Update account credit balance in the sheet"""
+    try:
+        accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+        accounts_sheet.update_cell(account_row, ACCOL_CREDITS, credits)
+        print(f"[Accounts] Updated credit balance: {credits}")
+    except Exception as e:
+        print(f"[ERROR] Failed to update account credits: {e}")
+
+def try_next_account_with_credits(sheet_service, spreadsheet_id, tried_accounts=None):
+    """Try to find an account with sufficient credits"""
+    if tried_accounts is None:
+        tried_accounts = []
+    
+    print(f"[Accounts] Trying to find account with sufficient credits...")
+    
+    for attempt in range(3):  # Try up to 3 different accounts
+        account = get_next_account(sheet_service, spreadsheet_id, tried_accounts)
+        if not account:
+            print("[ERROR] No more accounts available")
+            return None
+        
+        # Add to tried accounts list
+        tried_accounts.append(account['email'])
+        
+        # Test this account's credits
+        print(f"[Accounts] Testing credits for: {account['email']}")
+        
+        # Quick login and credit check
+        try:
+            # Import playwright here to avoid asyncio issues
+            from playwright.sync_api import sync_playwright
+            
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context()
+                page = context.new_page()
+                
+                # Login
+                login(page, account['email'], account['password'])
+                
+                # Check credits
+                credits = get_credit_balance(page)
+                account_type = detect_account_type(page)
+                
+                print(f"[Accounts] {account['email']} - Type: {account_type}, Credits: {credits}")
+                
+                # Update credits in sheet
+                update_account_credits(sheet_service, spreadsheet_id, account['row'], credits)
+                
+                # Proper logout
+                try:
+                    # Try to logout
+                    page.goto("https://magiclight.ai/logout", timeout=10000)
+                    time.sleep(2)
+                except:
+                    pass  # Logout failed, but continue
+                
+                browser.close()
+                
+                # Check if sufficient credits
+                if has_enough_credits(credits):
+                    print(f"[✅] Account {account['email']} has sufficient credits")
+                    return account
+                else:
+                    print(f"[❌] Account {account['email']} has insufficient credits ({credits} < 60)")
+                    # Mark as low credits
+                    accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+                    accounts_sheet.update_cell(account['row'], ACCOL_STATUS, 'Low Credits')
+                    
+        except Exception as e:
+            print(f"[ERROR] Failed to test account {account['email']}: {e}")
+            # Mark as cooldown
+            try:
+                accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+                accounts_sheet.update_cell(account['row'], ACCOL_STATUS, 'Cooldown')
+            except:
+                pass
+    
+    print("[ERROR] No account with sufficient credits found after 3 attempts")
+    return None
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    import os  # Ensure os is available in main function
+    import traceback  # Ensure traceback is available in main function
     global browser_instance
 
     args  = parse_args()
+    mode = args.mode
 
     print("=" * 60)
-    print("  AutoMagicAI — Video Generator")
-    print("  1: Generate videos (MagicLight.AI automation)")
+    print(f"  AutoMagicAI — Mode: {mode.upper()}")
+    if mode == "generate":
+        print("  Generating videos from MagicLight.AI...")
+    else:
+        print("  Processing videos (logo, trim, endscreen)...")
     print("=" * 60)
-    
-    choice = input("Select option 1 to continue: ").strip()
-    if choice != "1":
-        print("[ERROR] Invalid choice. Exiting.")
-        return
 
-    raw_limit = input("How many rows to proceed? (Leave blank for default): ").strip()
-    limit = int(raw_limit) if raw_limit.isdigit() else (args.maxstory if args.maxstory is not None else STORIES_PER_RUN)
+    if mode == "process":
+        try:
+            # Import and run VideoProcessor
+            import sys
+            import os
+            import argparse
+            from pathlib import Path
+            
+            # Add the parent directory to path to import VideoProcessor
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from process import run_cloud_mode
+            
+            print("[INFO] Starting VideoProcessor for video editing...")
+            
+            # Create args for VideoProcessor
+            processor_args = argparse.Namespace()
+            processor_args.mode = 'cloud'
+            processor_args.dry_run = False
+            processor_args.max = args.maxstory
+            
+            # Get FFmpeg path
+            import shutil
+            ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+            
+            # Get logo path
+            logo = Path("../assets/logo.png")
+            
+            # Run VideoProcessor
+            run_cloud_mode(processor_args, ffmpeg, logo)
+            return
+        except ImportError as e:
+            print(f"[ERROR] Could not import VideoProcessor: {e}")
+            print("[INFO] Make sure VideoProcessor is available in parent directory")
+            return
+        except Exception as e:
+            print(f"[ERROR] VideoProcessor failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+    # Generation mode continues below...
+    # Process one story at a time by default
+    limit = 1  # Always process 1 row per run
+    if args.maxstory is not None:
+        limit = args.maxstory
 
     # Determine headless mode: CLI args override .env setting
     if args.headless is not None:
@@ -1447,6 +2131,73 @@ def main():
         try:
             login(page, current_email, current_password)
             print("[Login] ✓ Account login successful")
+            
+            # Handle any immediate pop-ups after login
+            print("[Login] Checking for post-login pop-ups...")
+            handle_all_popups(page)
+            wait_for_page_ready(page, timeout=10)
+            
+            # Comprehensive credit system validation
+            if not validate_credit_system(page):
+                print("[ERROR] Credit system validation failed - trying next account")
+                
+                # Update current account's credit balance and mark as low credits
+                current_credits = get_credit_balance(page)
+                update_account_credits(sheet_service, SPREADSHEET_ID, account_row, current_credits)
+                
+                accounts_sheet = sheet_service.worksheet(ACCOUNTS_SHEET_NAME)
+                accounts_sheet.update_cell(account_row, ACCOL_STATUS, 'Low Credits')
+                
+                # PROPERLY LOGOUT before switching
+                try:
+                    print("[Logout] Logging out from current account...")
+                    page.goto("https://magiclight.ai/logout", timeout=10000)
+                    time.sleep(3)
+                    # Clear cookies and storage
+                    context.clear_cookies()
+                    context.clear_permissions()
+                except Exception as e:
+                    print(f"[Logout] Logout failed: {e}")
+                
+                browser.close()
+                
+                # Try to find another account with sufficient credits
+                tried_accounts = [current_email]
+                next_account = try_next_account_with_credits(sheet_service, SPREADSHEET_ID, tried_accounts)
+                
+                if not next_account:
+                    print("[ERROR] No account with sufficient credits found - stopping")
+                    return
+                
+                # Switch to the new account
+                print(f"[Switch] Using new account: {next_account['email']}")
+                current_email = next_account['email']
+                current_password = next_account['password']
+                account_row = next_account['row']
+                
+                # Restart browser with new account
+                browser = p.chromium.launch(headless=headless_mode, args=["--start-maximized"])
+                browser_instance = browser
+                context = browser.new_context(accept_downloads=True, no_viewport=True)
+                page = context.new_page()
+                
+                # Login with new account
+                login(page, current_email, current_password)
+                print("[Login] ✓ New account login successful")
+                
+                # Final credit validation (should pass)
+                if not validate_credit_system(page):
+                    print("[ERROR] Even new account failed credit validation - stopping")
+                    update_account_success(sheet_service, SPREADSHEET_ID, account_row, False)
+                    # PROPERLY LOGOUT
+                    try:
+                        page.goto("https://magiclight.ai/logout", timeout=10000)
+                        time.sleep(2)
+                    except:
+                        pass
+                    browser.close()
+                    return
+            
         except Exception as e:
             print(f"[FATAL] Login failed for {current_email}: {e}")
             # Mark account as cooldown on failure
@@ -1474,26 +2225,27 @@ def main():
                 status = row['E'].strip().lower()
             
             print(f"[Row {idx}] Status: '{status}'")
-            print(f"[Row {idx}] Full row data: {dict(row)}")
             
-            # ── Only process stories with "Generated" status ────────────────────────────
-            if status != "generated":
-                print(f"[Row {idx}] Skipping - status not 'generated'")
+            # ── Only process stories with "Generated" or "Pending" status ──────────────────
+            if status not in ["generated", "pending"]:
+                print(f"[Row {idx}] Skipping - status not 'generated' or 'pending'")
                 continue
 
             # ── Check for pending retry (has a Project URL saved) ─────────────
             project_url = str(row.get("Project URL", "") or "").strip()
-            story       = row.get("Story Text", "").strip() or row.get("Story", "").strip()
+            # Story data is in "Title/Story/Moral" column (based on debug output)
+            story_data = row.get("Title/Story/Moral", "").strip()
             
-            print(f"[Row {idx}] Story: '{story[:50]}...' | Project URL: '{project_url}'")
+            print(f"[Row {idx}] Story Data: '{story_data[:100]}...' | Project URL: '{project_url}'")
             
-            if not story:
-                print(f"[Row {idx}] Skipping - no story content")
+            if not story_data:
+                print(f"[Row {idx}] Skipping - no story content in 'Title/Story/Moral' column")
                 continue
 
-            title_hint = (row.get("Story Title", "") or row.get("Title", "") or f"Row_{idx}").strip() or f"Row_{idx}"
-            moral      = row.get("Moral", "").strip()
-            hashtags   = row.get("Hashtags", "").strip()
+            # Use row identifier since everything is in Column C
+            title_hint = f"Row_{idx}"
+            moral = ""  # Now part of story_data in Column C
+            hashtags = ""  # Now part of story_data in Column C
 
             # Build a filesystem-safe folder name
             safe_title = f"Row_{idx}_{title_hint[:40]}".replace(" ", "_") \
@@ -1503,7 +2255,7 @@ def main():
                            .replace("<", "_").replace(">", "_") \
                            .replace("|", "_")
 
-            prompt = story
+            prompt = story_data
             if moral:
                 prompt += f"\n\nMoral of the story: {moral}"
 
@@ -1564,6 +2316,7 @@ def main():
                     except Exception as e:
                         last_err = e
                         print(f"[ERROR] Row {idx} attempt {attempt} failed: {e}")
+                        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
 
                         # Save Project URL on any error so the next attempt can reopen it
                         try:
@@ -1629,6 +2382,7 @@ def main():
 
             except Exception as e:
                 print(f"[ERROR] Row {idx} failed: {e}")
+                print(f"[ERROR] Full traceback: {traceback.format_exc()}")
                 try:
                     sheet.update_cell(idx, COL_STATUS, "Error")
                     sheet.update_cell(idx, COL_NOTES,  str(e)[:500])
@@ -1641,6 +2395,26 @@ def main():
         print(f"\n{'='*60}")
         print(f"  Done! Processed {processed}/{limit} stories.")
         print(f"{'='*60}")
+
+        # Update final credit balance and mark account as successful
+        if processed > 0:
+            try:
+                final_credits = get_credit_balance(page)
+                update_account_credits(sheet_service, SPREADSHEET_ID, account_row, final_credits)
+                update_account_success(sheet_service, SPREADSHEET_ID, account_row, True)
+                print(f"[Success] Account {current_email} completed {processed} generations")
+                print(f"[Success] Final credit balance: {final_credits}")
+            except Exception as e:
+                print(f"[ERROR] Failed to update final account stats: {e}")
+
+        # PROPERLY LOGOUT before closing
+        try:
+            print("[Logout] Logging out before closing browser...")
+            page.goto("https://magiclight.ai/logout", timeout=10000)
+            time.sleep(3)
+            context.clear_cookies()
+        except Exception as e:
+            print(f"[Logout] Final logout failed: {e}")
 
         print("[Done] Closing browser automatically...")
         time.sleep(3)
