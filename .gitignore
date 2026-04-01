@@ -1,0 +1,29 @@
+# ── Python ──────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Environment & Credentials ─── NEVER COMMIT THESE ───────────────────────────
+.env
+auth.json
+auth_*.json
+
+# ── Output / Downloads ───────────────────────────────────────────────────────────
+output/
+screenshots/
+
+# ── CSV (contains story data — keep template, ignore data) ───────────────────────
+# stories.csv      ← Uncomment this line if you don't want to commit your story data
+
+# ── Temp / Dev files ─────────────────────────────────────────────────────────────
+inspect_dom.py
+patch_modal.py
+*.log
+*.tmp
+
+# ── OS ───────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
