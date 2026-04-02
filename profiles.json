@@ -1,0 +1,224 @@
+{
+  "profiles": {
+    "default": {
+      "name": "Default Processing",
+      "description": "Standard video processing with logo overlay and trimming",
+      "video_processing": {
+        "trim_seconds": 4,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 7,
+        "logo_y": 5,
+        "logo_width": 300,
+        "logo_opacity": 1.0,
+        "endscreen_enabled": true,
+        "endscreen_video": "assets/endscreen.mp4",
+        "endscreen_duration": "auto"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "veryfast",
+        "crf": 23,
+        "audio_bitrate": "128k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1080p",
+        "aspect_ratio": "16:9",
+        "frame_rate": 30,
+        "bitrate_strategy": "auto"
+      }
+    },
+    "youtube_shorts": {
+      "name": "YouTube Shorts",
+      "description": "Optimized for YouTube Shorts (vertical 9:16 videos)",
+      "video_processing": {
+        "trim_seconds": 2,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 5,
+        "logo_y": 10,
+        "logo_width": 200,
+        "logo_opacity": 0.9,
+        "endscreen_enabled": false,
+        "endscreen_video": "",
+        "endscreen_duration": "0"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "fast",
+        "crf": 24,
+        "audio_bitrate": "96k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1080x1920",
+        "aspect_ratio": "9:16",
+        "frame_rate": 30,
+        "bitrate_strategy": "shorts"
+      }
+    },
+    "youtube_standard": {
+      "name": "YouTube Standard",
+      "description": "Optimized for standard YouTube videos (16:9 horizontal)",
+      "video_processing": {
+        "trim_seconds": 4,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 7,
+        "logo_y": 5,
+        "logo_width": 300,
+        "logo_opacity": 1.0,
+        "endscreen_enabled": true,
+        "endscreen_video": "assets/endscreen.mp4",
+        "endscreen_duration": "auto"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "medium",
+        "crf": 22,
+        "audio_bitrate": "128k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1920x1080",
+        "aspect_ratio": "16:9",
+        "frame_rate": 30,
+        "bitrate_strategy": "standard"
+      }
+    },
+    "youtube_high_quality": {
+      "name": "YouTube High Quality",
+      "description": "High quality settings for premium YouTube content",
+      "video_processing": {
+        "trim_seconds": 3,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 10,
+        "logo_y": 8,
+        "logo_width": 350,
+        "logo_opacity": 0.95,
+        "endscreen_enabled": true,
+        "endscreen_video": "assets/endscreen.mp4",
+        "endscreen_duration": "auto"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "slow",
+        "crf": 20,
+        "audio_bitrate": "192k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1920x1080",
+        "aspect_ratio": "16:9",
+        "frame_rate": 30,
+        "bitrate_strategy": "high_quality"
+      }
+    },
+    "instagram_reel": {
+      "name": "Instagram Reel",
+      "description": "Optimized for Instagram Reels (vertical 9:16)",
+      "video_processing": {
+        "trim_seconds": 2,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 5,
+        "logo_y": 15,
+        "logo_width": 180,
+        "logo_opacity": 0.85,
+        "endscreen_enabled": false,
+        "endscreen_video": "",
+        "endscreen_duration": "0"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "fast",
+        "crf": 25,
+        "audio_bitrate": "96k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1080x1920",
+        "aspect_ratio": "9:16",
+        "frame_rate": 30,
+        "bitrate_strategy": "social_media"
+      }
+    },
+    "tiktok": {
+      "name": "TikTok",
+      "description": "Optimized for TikTok videos (vertical 9:16)",
+      "video_processing": {
+        "trim_seconds": 1,
+        "logo_enabled": true,
+        "logo_path": "assets/logo.png",
+        "logo_x": 5,
+        "logo_y": 20,
+        "logo_width": 150,
+        "logo_opacity": 0.8,
+        "endscreen_enabled": false,
+        "endscreen_video": "",
+        "endscreen_duration": "0"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "veryfast",
+        "crf": 26,
+        "audio_bitrate": "96k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1080x1920",
+        "aspect_ratio": "9:16",
+        "frame_rate": 30,
+        "bitrate_strategy": "social_media"
+      }
+    },
+    "no_logo": {
+      "name": "No Logo Processing",
+      "description": "Processing without logo overlay - trim only",
+      "video_processing": {
+        "trim_seconds": 4,
+        "logo_enabled": false,
+        "logo_path": "",
+        "logo_x": 0,
+        "logo_y": 0,
+        "logo_width": 0,
+        "logo_opacity": 0,
+        "endscreen_enabled": true,
+        "endscreen_video": "assets/endscreen.mp4",
+        "endscreen_duration": "auto"
+      },
+      "output_settings": {
+        "video_codec": "libx264",
+        "audio_codec": "aac",
+        "video_preset": "veryfast",
+        "crf": 23,
+        "audio_bitrate": "128k",
+        "pixel_format": "yuv420p",
+        "movflags": "+faststart"
+      },
+      "youtube_optimization": {
+        "target_resolution": "1920x1080",
+        "aspect_ratio": "16:9",
+        "frame_rate": 30,
+        "bitrate_strategy": "auto"
+      }
+    }
+  },
+  "default_profile": "default",
+  "version": "1.0.0",
+  "description": "VideoProcessor profiles for different YouTube and social media platforms"
+}

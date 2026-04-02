@@ -99,6 +99,145 @@ COL_PROCESSED   = 15   # O  — Drive URL of processed video  (set by us)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PROFILE MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+def load_profiles() -> dict:
+    """
+    Load profiles from profiles.json file.
+    Returns dict with profile data, or empty dict if file not found.
+    """
+    profiles_file = Path("profiles.json")
+    if not profiles_file.exists():
+        log.warning("profiles.json not found - using default settings")
+        return {}
+    
+    try:
+        with open(profiles_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        log.info(f"Loaded {len(data.get('profiles', {}))} profile(s) from profiles.json")
+        return data
+    except Exception as e:
+        log.error(f"Failed to load profiles.json - {e}")
+        return {}
+
+
+def get_profile(profile_name: str = None) -> dict:
+    """
+    Get a specific profile by name, or return default profile.
+    Falls back to hardcoded defaults if no profiles file exists.
+    """
+    profiles_data = load_profiles()
+    profiles = profiles_data.get('profiles', {})
+    
+    # Determine which profile to use
+    if profile_name and profile_name in profiles:
+        selected_profile = profiles[profile_name]
+        log.info(f"Using profile: {profile_name} - {selected_profile.get('description', '')}")
+    elif profile_name:
+        log.warning(f"Profile '{profile_name}' not found, using default")
+        selected_profile = profiles.get('default', {})
+    else:
+        # Use environment variable or default
+        env_profile = os.getenv("VIDEO_PROFILE", "")
+        if env_profile and env_profile in profiles:
+            selected_profile = profiles[env_profile]
+            log.info(f"Using profile from env: {env_profile} - {selected_profile.get('description', '')}")
+        else:
+            default_profile_name = profiles_data.get('default_profile', 'default')
+            selected_profile = profiles.get(default_profile_name, {})
+            log.info(f"Using default profile: {default_profile_name}")
+    
+    # Merge with hardcoded defaults for backward compatibility
+    return merge_profile_with_defaults(selected_profile)
+
+
+def merge_profile_with_defaults(profile: dict) -> dict:
+    """
+    Merge profile settings with hardcoded defaults for backward compatibility.
+    Environment variables take precedence over profile settings.
+    """
+    # Start with hardcoded defaults
+    merged = {
+        "video_processing": {
+            "trim_seconds": TRIM_SECONDS,
+            "logo_enabled": True,
+            "logo_path": LOGO_PATH,
+            "logo_x": LOGO_X,
+            "logo_y": LOGO_Y,
+            "logo_width": LOGO_WIDTH,
+            "logo_opacity": LOGO_OPACITY,
+            "endscreen_enabled": ENDSCREEN_ENABLED,
+            "endscreen_video": ENDSCREEN_VIDEO,
+            "endscreen_duration": ENDSCREEN_DURATION,
+        },
+        "output_settings": {
+            "video_codec": "libx264",
+            "audio_codec": "aac",
+            "video_preset": "veryfast",
+            "crf": 23,
+            "audio_bitrate": "128k",
+            "pixel_format": "yuv420p",
+            "movflags": "+faststart",
+        },
+        "youtube_optimization": {
+            "target_resolution": "1920x1080",
+            "aspect_ratio": "16:9",
+            "frame_rate": 30,
+            "bitrate_strategy": "auto",
+        }
+    }
+    
+    # Override with profile settings
+    if profile:
+        for section in ["video_processing", "output_settings", "youtube_optimization"]:
+            if section in profile:
+                merged[section].update(profile[section])
+    
+    # Override with environment variables (highest precedence)
+    merged["video_processing"]["trim_seconds"] = TRIM_SECONDS
+    merged["video_processing"]["logo_path"] = LOGO_PATH
+    merged["video_processing"]["logo_x"] = LOGO_X
+    merged["video_processing"]["logo_y"] = LOGO_Y
+    merged["video_processing"]["logo_width"] = LOGO_WIDTH
+    merged["video_processing"]["logo_opacity"] = LOGO_OPACITY
+    merged["video_processing"]["endscreen_enabled"] = ENDSCREEN_ENABLED
+    merged["video_processing"]["endscreen_video"] = ENDSCREEN_VIDEO
+    merged["video_processing"]["endscreen_duration"] = ENDSCREEN_DURATION
+    
+    return merged
+
+
+def list_profiles() -> list[str]:
+    """
+    Return list of available profile names.
+    """
+    profiles_data = load_profiles()
+    return list(profiles_data.get('profiles', {}).keys())
+
+
+def print_profiles():
+    """
+    Print all available profiles with their descriptions.
+    """
+    profiles_data = load_profiles()
+    profiles = profiles_data.get('profiles', {})
+    
+    if not profiles:
+        log.info("No profiles found in profiles.json")
+        return
+    
+    log.info("Available profiles:")
+    log.info("=" * 50)
+    for name, profile in profiles.items():
+        desc = profile.get('description', 'No description')
+        is_default = name == profiles_data.get('default_profile', 'default')
+        marker = " (default)" if is_default else ""
+        log.info(f"  {name}{marker}")
+        log.info(f"    {desc}")
+    log.info("=" * 50)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING  — console output only (no log files)
 # ══════════════════════════════════════════════════════════════════════════════
 def setup_logging() -> logging.Logger:
@@ -414,7 +553,7 @@ def get_duration(ffmpeg: str, path: Path) -> float:
 
 def run_ffmpeg_process(ffmpeg: str, input_path: Path,
                        output_path: Path, logo: Path,
-                       trim_sec: int) -> bool:
+                       trim_sec: int, profile: dict = None) -> bool:
     """
     Single FFmpeg command that does:
       1. Overlay logo.png at top-left corner  → hides MagicLight watermark
@@ -422,6 +561,47 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
       3. Add endscreen (if enabled)          → custom branding/outro
     Returns True on success.
     """
+    # Use profile settings or fallback to provided parameters
+    if profile:
+        vp = profile.get('video_processing', {})
+        actual_trim_sec = vp.get('trim_seconds', trim_sec)
+        logo_enabled = vp.get('logo_enabled', True)
+        logo_x = vp.get('logo_x', LOGO_X)
+        logo_y = vp.get('logo_y', LOGO_Y)
+        logo_width = vp.get('logo_width', LOGO_WIDTH)
+        logo_opacity = vp.get('logo_opacity', LOGO_OPACITY)
+        endscreen_enabled = vp.get('endscreen_enabled', ENDSCREEN_ENABLED)
+        endscreen_video = vp.get('endscreen_video', ENDSCREEN_VIDEO)
+        endscreen_duration = vp.get('endscreen_duration', ENDSCREEN_DURATION)
+        
+        out = profile.get('output_settings', {})
+        video_codec = out.get('video_codec', 'libx264')
+        audio_codec = out.get('audio_codec', 'aac')
+        video_preset = out.get('video_preset', 'veryfast')
+        crf = out.get('crf', 23)
+        audio_bitrate = out.get('audio_bitrate', '128k')
+        pixel_format = out.get('pixel_format', 'yuv420p')
+        movflags = out.get('movflags', '+faststart')
+    else:
+        # Fallback to provided parameters and global variables
+        actual_trim_sec = trim_sec
+        logo_enabled = True
+        logo_x = LOGO_X
+        logo_y = LOGO_Y
+        logo_width = LOGO_WIDTH
+        logo_opacity = LOGO_OPACITY
+        endscreen_enabled = ENDSCREEN_ENABLED
+        endscreen_video = ENDSCREEN_VIDEO
+        endscreen_duration = ENDSCREEN_DURATION
+        
+        video_codec = 'libx264'
+        audio_codec = 'aac'
+        video_preset = 'veryfast'
+        crf = 23
+        audio_bitrate = '128k'
+        pixel_format = 'yuv420p'
+        movflags = '+faststart'
+
     log.info(f"FFmpeg: getting duration of '{input_path.name}'...")
     try:
         input_info = get_video_info(ffmpeg, input_path)
@@ -434,9 +614,9 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
 
     # Check if endscreen is enabled and file exists
     endscreen_path = None
-    endscreen_duration = ENDSCREEN_DURATION
-    if ENDSCREEN_ENABLED:
-        endscreen_path = Path(ENDSCREEN_VIDEO)
+    actual_endscreen_duration = endscreen_duration
+    if endscreen_enabled:
+        endscreen_path = Path(endscreen_video)
         if not endscreen_path.exists():
             log.warning(f"FFmpeg: endscreen enabled but file not found at '{endscreen_path}' — skipping endscreen")
             endscreen_path = None
@@ -444,21 +624,24 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
             # Auto-detect duration if set to "auto"
             if endscreen_duration == "auto":
                 try:
-                    endscreen_duration = get_duration(ffmpeg, endscreen_path)
-                    log.info(f"FFmpeg: endscreen enabled → auto-detected {endscreen_duration:.1f}s from '{endscreen_path.name}'")
+                    actual_endscreen_duration = get_duration(ffmpeg, endscreen_path)
+                    log.info(f"FFmpeg: endscreen enabled → auto-detected {actual_endscreen_duration:.1f}s from '{endscreen_path.name}'")
                 except Exception as e:
                     log.warning(f"FFmpeg: failed to get endscreen duration — {e} — using 5s default")
-                    endscreen_duration = 5
+                    actual_endscreen_duration = 5
             else:
-                endscreen_duration = float(endscreen_duration)
-                log.info(f"FFmpeg: endscreen enabled → {endscreen_duration}s from '{endscreen_path.name}'")
+                actual_endscreen_duration = float(endscreen_duration)
+                log.info(f"FFmpeg: endscreen enabled → {actual_endscreen_duration}s from '{endscreen_path.name}'")
 
-    end_time = max(1.0, duration - trim_sec)
-    log.info(f"FFmpeg: duration={duration:.1f}s  trim={trim_sec}s  "
+    end_time = max(1.0, duration - actual_trim_sec)
+    log.info(f"FFmpeg: duration={duration:.1f}s  trim={actual_trim_sec}s  "
              f"output ends at {end_time:.1f}s")
 
-    if not logo.exists():
-        log.warning(f"FFmpeg: logo not found at '{logo}' — trim only (no overlay)")
+    if not logo_enabled or not logo.exists():
+        if not logo_enabled:
+            log.info(f"FFmpeg: logo disabled in profile — trim only (no overlay)")
+        else:
+            log.warning(f"FFmpeg: logo not found at '{logo}' — trim only (no overlay)")
         
         if endscreen_path:
             # Trim + endscreen (no logo) - simple concat
@@ -466,12 +649,12 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(input_path),
                 "-i", str(endscreen_path),
-                "-filter_complex", f"[0:v]trim=end={end_time},format=yuv420p[v1];[1:v]trim=duration={endscreen_duration},scale={input_width}:{input_height},format=yuv420p[v2];[v1][v2]concat=n=2:v=1:a=0[outv]",
+                "-filter_complex", f"[0:v]trim=end={end_time},format=yuv420p[v1];[1:v]trim=duration={actual_endscreen_duration},scale={input_width}:{input_height},format=yuv420p[v2];[v1][v2]concat=n=2:v=1:a=0[outv]",
                 "-map", "[outv]",
                 "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:v", video_codec, "-preset", video_preset, "-crf", str(crf),
+                "-c:a", audio_codec, "-b:a", audio_bitrate,
+                "-pix_fmt", pixel_format, "-movflags", movflags,
                 str(output_path)
             ]
         else:
@@ -480,18 +663,18 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(input_path),
                 "-t", str(end_time),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:v", video_codec, "-preset", video_preset, "-crf", str(crf),
+                "-c:a", audio_codec, "-b:a", audio_bitrate,
+                "-pix_fmt", pixel_format, "-movflags", movflags,
                 str(output_path)
             ]
     else:
         if endscreen_path:
             # Logo + trim + endscreen - simple concat
-            logo_f = f"[1:v]scale={LOGO_WIDTH}:-1"
-            if LOGO_OPACITY < 1.0:
-                logo_f += f",colorchannelmixer=aa={LOGO_OPACITY:.2f}"
-            logo_f += f"[logo];[0:v][logo]overlay=x={LOGO_X}:y={LOGO_Y}[v1];[v1]trim=end={end_time},format=yuv420p[v2];[2:v]trim=duration={endscreen_duration},scale={input_width}:{input_height},format=yuv420p[v3];[v2][v3]concat=n=2:v=1:a=0[outv]"
+            logo_f = f"[1:v]scale={logo_width}:-1"
+            if logo_opacity < 1.0:
+                logo_f += f",colorchannelmixer=aa={logo_opacity:.2f}"
+            logo_f += f"[logo];[0:v][logo]overlay=x={logo_x}:y={logo_y}[v1];[v1]trim=end={end_time},format=yuv420p[v2];[2:v]trim=duration={actual_endscreen_duration},scale={input_width}:{input_height},format=yuv420p[v3];[v2][v3]concat=n=2:v=1:a=0[outv]"
             
             cmd = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -501,17 +684,17 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
                 "-filter_complex", logo_f,
                 "-map", "[outv]",
                 "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:v", video_codec, "-preset", video_preset, "-crf", str(crf),
+                "-c:a", audio_codec, "-b:a", audio_bitrate,
+                "-pix_fmt", pixel_format, "-movflags", movflags,
                 str(output_path)
             ]
         else:
             # Logo + trim (no endscreen)
-            logo_f = f"[1:v]scale={LOGO_WIDTH}:-1"
-            if LOGO_OPACITY < 1.0:
-                logo_f += f",colorchannelmixer=aa={LOGO_OPACITY:.2f}"
-            logo_f += f"[logo];[0:v][logo]overlay=x={LOGO_X}:y={LOGO_Y}[v]"
+            logo_f = f"[1:v]scale={logo_width}:-1"
+            if logo_opacity < 1.0:
+                logo_f += f",colorchannelmixer=aa={logo_opacity:.2f}"
+            logo_f += f"[logo];[0:v][logo]overlay=x={logo_x}:y={logo_y}[v]"
 
             cmd = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -521,9 +704,9 @@ def run_ffmpeg_process(ffmpeg: str, input_path: Path,
                 "-filter_complex", logo_f,
                 "-map", "[v]",
                 "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:v", video_codec, "-preset", video_preset, "-crf", str(crf),
+                "-c:a", audio_codec, "-b:a", audio_bitrate,
+                "-pix_fmt", pixel_format, "-movflags", movflags,
                 str(output_path)
             ]
 
@@ -556,7 +739,7 @@ def safe_name(row_idx: int, title: str) -> str:
 #  MODE 1 — CLOUD MODE  (GitHub Actions)
 #  Reads rows from Google Sheet, downloads from Drive, processes, re-uploads
 # ══════════════════════════════════════════════════════════════════════════════
-def run_cloud_mode(args, ffmpeg: str, logo: Path):
+def run_cloud_mode(args, ffmpeg: str, logo: Path, profile: dict = None):
     log.info("=" * 60)
     log.info("MODE: Cloud (Google Sheet + Drive)")
     log.info("=" * 60)
@@ -617,7 +800,7 @@ def run_cloud_mode(args, ffmpeg: str, logo: Path):
 
             # Process
             out_path = tmp_dir / f"{folder_nm}_processed.mp4"
-            ok = run_ffmpeg_process(ffmpeg, raw_path, out_path, logo, TRIM_SECONDS)
+            ok = run_ffmpeg_process(ffmpeg, raw_path, out_path, logo, TRIM_SECONDS, profile)
             raw_path.unlink(missing_ok=True)   # free space immediately
 
             if not ok:
@@ -671,7 +854,7 @@ def collect_local_videos(scan_root: Path) -> list[Path]:
     return found
 
 
-def run_local_mode(args, ffmpeg: str, logo: Path):
+def run_local_mode(args, ffmpeg: str, logo: Path, profile: dict = None):
     log.info("=" * 60)
     log.info("MODE: Local PC")
     log.info("=" * 60)
@@ -743,7 +926,7 @@ def run_local_mode(args, ffmpeg: str, logo: Path):
             out_path = video_path.parent / f"{video_path.stem}_processed.mp4"
 
         # Process
-        ok = run_ffmpeg_process(ffmpeg, video_path, out_path, logo, TRIM_SECONDS)
+        ok = run_ffmpeg_process(ffmpeg, video_path, out_path, logo, TRIM_SECONDS, profile)
         if not ok:
             fail_count += 1
             continue
@@ -827,6 +1010,14 @@ def main():
         )
     )
     parser.add_argument(
+        "--profile", default=None,
+        help="Processing profile to use (from profiles.json). Use --list-profiles to see options."
+    )
+    parser.add_argument(
+        "--list-profiles", action="store_true",
+        help="List all available processing profiles and exit."
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Scan and print what would be processed, but make no changes."
     )
@@ -835,6 +1026,18 @@ def main():
         help="Maximum number of videos to process in this run."
     )
     args = parser.parse_args()
+
+    # Handle --list-profiles
+    if args.list_profiles:
+        print_profiles()
+        sys.exit(0)
+
+    # Load profile
+    profile = get_profile(args.profile)
+    
+    # Extract profile settings for display
+    vp = profile.get('video_processing', {})
+    out = profile.get('output_settings', {})
 
     # ── Auto-detect mode ──────────────────────────────────────────────────────
     if args.mode is None:
@@ -854,8 +1057,11 @@ def main():
     log.info("=" * 60)
     log.info("  VideoProcessor")
     log.info(f"  Mode      : {args.mode}")
-    log.info(f"  Trim      : {TRIM_SECONDS}s from end")
-    log.info(f"  Logo      : {LOGO_PATH}  pos=({LOGO_X},{LOGO_Y})  w={LOGO_WIDTH}px")
+    log.info(f"  Profile   : {args.profile or 'default'}")
+    log.info(f"  Trim      : {vp.get('trim_seconds', TRIM_SECONDS)}s from end")
+    log.info(f"  Logo      : {vp.get('logo_path', LOGO_PATH)}  pos=({vp.get('logo_x', LOGO_X)},{vp.get('logo_y', LOGO_Y)})  w={vp.get('logo_width', LOGO_WIDTH)}px")
+    log.info(f"  Endscreen : {'enabled' if vp.get('endscreen_enabled', ENDSCREEN_ENABLED) else 'disabled'}")
+    log.info(f"  Quality   : {out.get('video_codec', 'libx264')} CRF {out.get('crf', 23)} preset {out.get('video_preset', 'veryfast')}")
     log.info(f"  Drive     : {DRIVE_FOLDER_ID or 'NOT SET'}")
     log.info(f"  Dry run   : {args.dry_run}")
     log.info("=" * 60)
@@ -869,20 +1075,25 @@ def main():
         sys.exit(1)
 
     # ── Find logo ─────────────────────────────────────────────────────────────
-    logo = Path(LOGO_PATH)
-    if logo.exists():
+    logo_path = vp.get('logo_path', LOGO_PATH)
+    logo = Path(logo_path)
+    if vp.get('logo_enabled', True) and logo.exists():
         log.info(f"Logo: found → {logo.resolve()}")
-    else:
+    elif vp.get('logo_enabled', True):
         log.warning(f"Logo NOT found at '{logo}' — will trim only, no watermark cover.")
+    else:
+        log.info("Logo: disabled in profile")
 
     # ── Check endscreen ───────────────────────────────────────────────────────
-    if ENDSCREEN_ENABLED:
-        endscreen = Path(ENDSCREEN_VIDEO)
+    if vp.get('endscreen_enabled', ENDSCREEN_ENABLED):
+        endscreen_video = vp.get('endscreen_video', ENDSCREEN_VIDEO)
+        endscreen = Path(endscreen_video)
         if endscreen.exists():
-            if ENDSCREEN_DURATION == "auto":
+            endscreen_duration = vp.get('endscreen_duration', ENDSCREEN_DURATION)
+            if endscreen_duration == "auto":
                 log.info(f"Endscreen: enabled → auto duration from '{endscreen.name}'")
             else:
-                log.info(f"Endscreen: enabled → {ENDSCREEN_DURATION}s from '{endscreen.name}'")
+                log.info(f"Endscreen: enabled → {endscreen_duration}s from '{endscreen.name}'")
         else:
             log.warning(f"Endscreen enabled but file not found at '{endscreen}' — skipping endscreen")
     else:
@@ -890,9 +1101,9 @@ def main():
 
     # ── Run selected mode ─────────────────────────────────────────────────────
     if args.mode == "cloud":
-        run_cloud_mode(args, ffmpeg, logo)
+        run_cloud_mode(args, ffmpeg, logo, profile)
     else:
-        run_local_mode(args, ffmpeg, logo)
+        run_local_mode(args, ffmpeg, logo, profile)
 
 
 if __name__ == "__main__":
