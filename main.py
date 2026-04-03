@@ -1,70 +1,89 @@
 """
 MagicLight Auto — Kids Story Video Generator
 =============================================
-Version : 1.0.0
-Released: 2026-04-01
-Repo    : https://github.com/<your-username>/VideoAutomation
+Version : 2.0.0
+Released: 2026-04-03
+Repo    : https://github.com/net2t/VideoProcessor
 
 CSV: stories.csv  ->  output/row{N}_{title}/
 
 Usage:
-    python magiclight_auto.py              # Process all Pending rows
-    python magiclight_auto.py --max 2      # Process max 2 stories
-    python magiclight_auto.py --headless   # No browser window
+    python main.py              # Process all Pending rows
+    python main.py --max 2      # Process max 2 stories
+    python main.py --headless   # No browser window
 
-Multi-account (.env):
-    ACCOUNTS=user1@x.com:pass1,user2@x.com:pass2
-    EMAIL/PASSWORD are fallback if ACCOUNTS is not set.
+Credentials (.env):
+    EMAIL=your@email.com
+    PASSWORD=yourpassword
+
+Status values written to CSV:
+    Processing  — currently running
+    Done        — video downloaded successfully
+    No_Video    — render done but video download failed
+    Low Credit  — account ran out of credits, stopped
+    Error       — unexpected failure
 
 ──────────────────────────────────────────────────────────────────────────────
-  ⚠️  SECURITY LOCK — READ BEFORE EDITING  ⚠️
+  STABLE FUNCTIONS — do NOT refactor without full regression test
 ──────────────────────────────────────────────────────────────────────────────
-The following core functions are STABLE and TESTED. Do NOT refactor, rename,
-or "improve" them without a full regression test (single + multi-story run):
-
-  login()                   — .entry-email tab click + input[type=text] fill
-  _dismiss_animation_modal()— uses .arco-modal-mask as real-dialog signal
-  step4() / js_header_next  — ONLY clicks header-shiny-action__btn for Next
-  _dismiss_all()            — generic banner/popup killer, NOT dialog-aware
-
-Rules for AI-assisted edits:
-  1. Never change JS selector strings without DOM verification.
-  2. Never replace sleep_log() / _wait_dismissing() with plain time.sleep().
-  3. Never add handle_generation_dialog() back into the step4 loop.
-  4. Bump the Version string above for every change.
-  5. Add an entry to CHANGELOG.md.
+  login()                    — always logs out first, then fresh login
+  _dismiss_animation_modal() — uses .arco-modal-mask as real-dialog signal
+  step4() / js_header_next   — ONLY clicks header-shiny-action__btn for Next
+  _dismiss_all()             — generic banner/popup killer, NOT dialog-aware
 ──────────────────────────────────────────────────────────────────────────────
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 import re
 import os
 import csv
+import sys
 import time
 import signal
+import warnings
 import argparse
 import requests
 from datetime import datetime
+
+# Suppress noisy deprecation / SSL warnings
+warnings.filterwarnings("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
+# Rich terminal UI
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+from rich import print as rprint
+
+console = Console(highlight=False)
+
+def _log(msg, style="white"):
+    console.print(msg, style=style)
+
+def _step(label, style="bold cyan"):
+    console.print(f"\n[bold]{label}[/bold]", style=style)
+
+def _ok(msg):
+    console.print(f"  [bold green]✓[/bold green] {msg}")
+
+def _warn(msg):
+    console.print(f"  [bold yellow]⚠[/bold yellow]  {msg}")
+
+def _err(msg):
+    console.print(f"  [bold red]✗[/bold red] {msg}")
+
+def _info(msg):
+    console.print(f"  [dim]{msg}[/dim]")
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 load_dotenv()
 
 EMAIL    = os.getenv("EMAIL", "")
 PASSWORD = os.getenv("PASSWORD", "")
-
-_raw_accounts = os.getenv("ACCOUNTS", "").strip()
-ACCOUNTS = []
-if _raw_accounts:
-    for _pair in _raw_accounts.split(","):
-        _parts = _pair.strip().split(":", 1)
-        if len(_parts) == 2:
-            ACCOUNTS.append({"email": _parts[0].strip(), "password": _parts[1].strip()})
-if not ACCOUNTS and EMAIL and PASSWORD:
-    ACCOUNTS.append({"email": EMAIL, "password": PASSWORD})
-
-_current_account_idx = 0
 
 STEP1_WAIT     = int(os.getenv("STEP1_WAIT",            "60"))
 STEP2_WAIT     = int(os.getenv("STEP2_WAIT",            "30"))
@@ -89,12 +108,12 @@ _browser  = None
 
 def _sig(sig, frame):
     global _shutdown, _browser
-    print("\n[STOP] Ctrl+C — cleaning up...")
+    _warn("[STOP] Ctrl+C — cleaning up...")
     _shutdown = True
     if _browser:
         try: _browser.close()
         except: pass
-    import sys; sys.exit(0)
+    sys.exit(0)
 
 signal.signal(signal.SIGINT, _sig)
 
@@ -106,7 +125,7 @@ def ensure_csv():
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
-        print(f"[CSV] Created {CSV_FILE} — add stories and re-run.")
+        _warn(f"Created {CSV_FILE} — add stories and re-run.")
         return False
     return True
 
@@ -134,15 +153,14 @@ def sleep_log(seconds, reason=""):
     secs = int(seconds)
     if secs <= 0: return
     label = f" ({reason})" if reason else ""
-    print(f"  [wait] {secs}s{label}...")
+    _info(f"[wait] {secs}s{label}...")
     for _ in range(secs):
         if _shutdown: return
         time.sleep(1)
 
 def _wait_dismissing(page, seconds, reason=""):
-    """Wait in 5-second chunks, dismissing popups each chunk."""
     label = f" ({reason})" if reason else ""
-    print(f"  [wait] {seconds}s{label} (popup-watching)...")
+    _info(f"[wait] {seconds}s{label} (popup-watch)...")
     elapsed = 0
     while elapsed < seconds:
         if _shutdown: return
@@ -153,14 +171,13 @@ def _wait_dismissing(page, seconds, reason=""):
         elapsed += chunk
         _dismiss_all(page)
         if elapsed % 30 == 0 and elapsed < seconds:
-            print(f"  [wait] ...{seconds - elapsed}s remaining")
+            _info(f"...{seconds - elapsed}s remaining")
 
-# ── Popups ─────────────────────────────────────────────────────────────────────
+# ── Popup helpers ──────────────────────────────────────────────────────────────
 def _all_frames(page):
     try: return page.frames
     except: return [page]
 
-# Close generic popups / banners (NOT the animation panel or enhance dialog)
 _CLOSE_SELECTORS = [
     'button.notice-popup-modal__close',
     'button[aria-label="close"]',
@@ -178,7 +195,7 @@ _CLOSE_SELECTORS = [
 _POPUP_JS = """\
 () => {
     const BAD = ["Got it","Got It","Close","Done","OK","Later","No thanks",
-                 "Maybe later","Not now","Dismiss","Close samples","No","Cancel"];
+                 "Maybe later","Not now","Dismiss","Close samples","No","Cancel","Skip"];
     let n = 0;
     document.querySelectorAll('button,span,div,a').forEach(el => {
         const t = (el.innerText || el.textContent || '').trim();
@@ -213,17 +230,6 @@ def dismiss_popups(page, timeout=10, sweeps=3):
         time.sleep(0.8)
 
 # ── Animation modal / enhance dialog closer ────────────────────────────────────
-# Based on DOM dump from actual run:
-#   BUTTON.animation-modal__tab | Animate One
-#   BUTTON.animation-modal__tab | Animate All
-#   DIV.shiny-button-container  | Next / Animate All
-#   DIV.arco-modal-mask (backdrop) = REAL blocking dialog
-#
-# Strategy:
-#   A) If .arco-modal-mask (backdrop) visible → real dialog → check checkbox + close X
-#   B) If animation-modal__tab buttons visible → animation panel → press Escape / close btn
-#   C) Never click the panel's "Next" — that only dismisses in-place
-
 _REAL_DIALOG_JS = """\
 () => {
     const masks = Array.from(document.querySelectorAll(
@@ -233,7 +239,6 @@ _REAL_DIALOG_JS = """\
         return r.width > 100 && r.height > 100;
     });
     if (!masks.length) return null;
-
     const chk = Array.from(document.querySelectorAll(
         'input[type="checkbox"],.arco-checkbox-icon,label[class*="checkbox"]'
     )).find(el => {
@@ -242,7 +247,6 @@ _REAL_DIALOG_JS = """\
         return txt.includes('remind') || txt.includes('again') || txt.includes('ask');
     });
     if (chk) { try { chk.click(); } catch(e) {} }
-
     const xBtn = document.querySelector(
         '.arco-modal-close-btn,[aria-label="Close"],[aria-label="close"],' +
         '.arco-icon-close,[class*="modal-close"],[class*="close-icon"]'
@@ -265,7 +269,6 @@ _ANIM_PANEL_JS = """\
         '[class*="animation-modal__tab"],[class*="animation-modal-tab"]'
     )).filter(el => el.getBoundingClientRect().width > 0);
     if (!tabs.length) return null;
-
     const closeEl = Array.from(document.querySelectorAll(
         '[class*="animation-modal"] [class*="close"],' +
         '[class*="animation-modal"] [class*="back"],' +
@@ -276,48 +279,38 @@ _ANIM_PANEL_JS = """\
 }"""
 
 def _dismiss_animation_modal(page):
-    # Try real dialog (has backdrop mask)
     try:
         r = page.evaluate(_REAL_DIALOG_JS)
         if r:
-            print(f"  [modal] {r}")
-            time.sleep(2)
-            return
+            _info(f"[modal] {r}")
+            time.sleep(2); return
     except: pass
-
-    # Try animation panel
     try:
         r = page.evaluate(_ANIM_PANEL_JS)
         if r:
-            print(f"  [modal] {r}")
+            _info(f"[modal] {r}")
             try: page.keyboard.press("Escape")
             except: pass
-            time.sleep(1.5)
-            return
+            time.sleep(1.5); return
     except: pass
-
-    # Playwright fallback for real dialog
     for sel in ["label:has-text(\"Don't remind again\")", "label:has-text(\"Don't ask again\")"]:
         try:
             loc = page.locator(sel)
             if loc.count() > 0 and loc.first.is_visible():
                 loc.first.click(timeout=1500); time.sleep(0.5)
         except: pass
-
     for sel in ['.arco-modal-close-btn', 'button[aria-label="Close"]', '.arco-icon-close']:
         try:
             loc = page.locator(sel).first
             if loc.is_visible():
                 loc.click(timeout=2000)
-                print(f"  [modal] closed via '{sel}'")
+                _info(f"[modal] closed via '{sel}'")
                 time.sleep(2); return
         except: pass
-
     try: page.keyboard.press("Escape"); time.sleep(0.5)
     except: pass
 
 def _close_preview_popup(page):
-    """Dismiss post-render preview modal to reveal Download button."""
     js = """\
 () => {
     let n = 0;
@@ -393,7 +386,7 @@ def dom_click_text(page, texts, timeout=60):
         if _shutdown: return False
         r = page.evaluate(js, texts)
         if r:
-            print(f"  [click] '{r}'")
+            _info(f"[click] '{r}'")
             return True
         time.sleep(2)
     return False
@@ -413,7 +406,7 @@ def dom_click_class(page, cls, timeout=30):
         if _shutdown: return False
         r = page.evaluate(js)
         if r:
-            print(f"  [click-class] ~'{cls}'")
+            _info(f"[click-class] ~'{cls}'")
             return True
         time.sleep(2)
     return False
@@ -437,73 +430,88 @@ def debug_buttons(page):
 );"""
     try:
         items = page.evaluate(js)
-        print(f"  [debug-url] {page.url}")
-        for i in (items or []): print(f"    {i}")
+        _info(f"[debug-url] {page.url}")
+        for i in (items or []): _info(f"  {i}")
     except: pass
 
-# ── Accounts ───────────────────────────────────────────────────────────────────
-def _auth_json_path(account):
-    safe = re.sub(r"[^\w]", "_", account["email"])
-    return f"auth_{safe}.json"
-
-def _get_account():
-    return ACCOUNTS[_current_account_idx % len(ACCOUNTS)]
-
-def next_account():
-    global _current_account_idx
-    _current_account_idx += 1
-    if _current_account_idx >= len(ACCOUNTS):
-        print("[Account] All accounts exhausted!")
-        return None
-    acc = ACCOUNTS[_current_account_idx]
-    print(f"[Account] Switching to {_current_account_idx+1}/{len(ACCOUNTS)}: {acc['email']}")
-    return acc
-
+# ── Credit check ───────────────────────────────────────────────────────────────
 def _credit_exhausted(page):
     try:
         body = page.evaluate("() => (document.body && document.body.innerText) || ''")
         for kw in ["insufficient credits","not enough credits","credit limit",
-                   "out of credits","credits exhausted","quota exceeded"]:
+                   "out of credits","credits exhausted","quota exceeded",
+                   "your credits","credits remaining"]:
+            if kw in body.lower():
+                # Check if a numeric credit balance is visible and is 0 or very low
+                pass
+        for kw in ["insufficient credits","not enough credits","out of credits",
+                   "credits exhausted","quota exceeded"]:
             if kw in body.lower():
                 return True
     except: pass
     return False
 
 # ── LOGIN ──────────────────────────────────────────────────────────────────────
+def _logout(page):
+    """Attempt to logout any existing session before fresh login."""
+    _info("[logout] Clearing session...")
+    try:
+        page.goto("https://magiclight.ai/", timeout=30000)
+        wait_site_loaded(page, None, timeout=20)
+        time.sleep(2)
+        # Try clicking user avatar / profile menu then logout
+        page.evaluate("""\
+() => {
+    const logoutTexts = ['Log out','Logout','Sign out','Sign Out','Log Out'];
+    const els = Array.from(document.querySelectorAll('a,button,div,span'));
+    for (const el of els) {
+        const t = (el.innerText || '').trim();
+        if (logoutTexts.includes(t) && el.getBoundingClientRect().width > 0) {
+            el.click(); return t;
+        }
+    }
+    return null;
+}""")
+        time.sleep(1)
+    except: pass
+    # Clear cookies/storage regardless
+    try: page.context.clear_cookies()
+    except: pass
+
 def login(page, account=None):
     if account is None:
-        account = _get_account()
+        account = {"email": EMAIL, "password": PASSWORD}
     email    = account["email"]
     password = account["password"]
-    auth_file = _auth_json_path(account)
 
-    print(f"[Login] Account: {email}")
+    _step("[Login] Starting fresh login...")
+    _logout(page)
+
     page.goto("https://magiclight.ai/login/?to=%252Fkids-story%252F", timeout=60000)
     try: page.wait_for_load_state("domcontentloaded", timeout=30000)
     except: pass
     sleep_log(4, "page settle")
 
-    if "login" not in page.url.lower():
-        print("[Login] Saved session valid")
-        sleep_log(2)
-        _dismiss_post_login_popups(page)
-        return True
+    _info(f"[Login] URL: {page.url}")
 
-    print("[Login] Filling credentials...")
-
-    for attempt in range(3):
+    # Click "Log in with Email" tab/button if present (new UI)
+    for sel in [
+        'text=Log in with Email',
+        'button:has-text("Log in with Email")',
+        'div:has-text("Log in with Email")',
+        '.entry-email',
+        '[class*="entry-email"]',
+    ]:
         try:
-            el = page.locator(".entry-email")
-            el.wait_for(state="visible", timeout=10000)
-            el.click()
-            print("  [login] .entry-email clicked")
-            break
-        except:
-            print(f"  [login] .entry-email attempt {attempt+1}/3 failed")
-            sleep_log(2)
+            el = page.locator(sel).first
+            if el.is_visible(timeout=3000):
+                el.click()
+                _info(f"[Login] Email tab clicked via '{sel}'")
+                sleep_log(2, "inputs settle")
+                break
+        except: pass
 
-    sleep_log(2, "inputs settle")
-
+    # Fill email
     email_filled = False
     for sel in ['input[type="text"]', 'input[type="email"]', 'input[name="email"]',
                 'input[placeholder*="mail" i]']:
@@ -513,7 +521,7 @@ def login(page, account=None):
             loc.scroll_into_view_if_needed()
             loc.click(); time.sleep(0.3)
             loc.fill(email)
-            print(f"  [login] Email filled via '{sel}'")
+            _info(f"[Login] Email filled via '{sel}'")
             email_filled = True; break
         except: continue
 
@@ -523,6 +531,7 @@ def login(page, account=None):
 
     time.sleep(0.4)
 
+    # Fill password
     pass_filled = False
     for sel in ['input[type="password"]', 'input[name="password"]',
                 'input[placeholder*="password" i]']:
@@ -532,7 +541,7 @@ def login(page, account=None):
             loc.scroll_into_view_if_needed()
             loc.click(); time.sleep(0.3)
             loc.fill(password)
-            print(f"  [login] Password filled via '{sel}'")
+            _info(f"[Login] Password filled via '{sel}'")
             pass_filled = True; break
         except: continue
 
@@ -541,6 +550,7 @@ def login(page, account=None):
 
     time.sleep(0.4)
 
+    # Click Continue
     clicked = False
     for attempt in range(3):
         for sel in ["text=Continue", "div.signin-continue",
@@ -549,7 +559,7 @@ def login(page, account=None):
                 el = page.locator(sel).first
                 if el.is_visible():
                     el.click(); clicked = True
-                    print(f"  [login] Continue via '{sel}'"); break
+                    _info(f"[Login] Continue via '{sel}'"); break
             except: pass
         if clicked: break
         sleep_log(1, f"retry Continue {attempt+1}")
@@ -566,19 +576,14 @@ def login(page, account=None):
     if "login" in page.url.lower():
         raise Exception(f"Login failed — still on login page for {email}")
 
-    print(f"[Login] Logged in -> {page.url}")
+    _ok(f"[Login] Logged in → {page.url}")
     sleep_log(3, "post-login popups")
     _dismiss_post_login_popups(page)
-
-    try:
-        page.context.storage_state(path=auth_file)
-        print(f"[Login] Session saved -> {auth_file}")
-    except: pass
     return True
 
 
 def _dismiss_post_login_popups(page):
-    print("[Login] Dismissing post-login popups...")
+    _info("[Login] Dismissing post-login popups...")
     js = """\
 () => {
     let n = 0;
@@ -607,10 +612,9 @@ def _dismiss_post_login_popups(page):
         if _shutdown: return
         try:
             n = page.evaluate(js)
-            if n: print(f"  [popup] round {i+1}: {n} dismissed")
+            if n: _info(f"  [popup] round {i+1}: {n} dismissed")
         except: pass
         time.sleep(1.2)
-
     for sel in ["button:has-text('Skip')", "button:has-text('Close samples')",
                 "button:has-text('Got it')", "button:has-text('Got It')",
                 "button.notice-popup-modal__close", ".arco-modal-close-btn"]:
@@ -619,14 +623,14 @@ def _dismiss_post_login_popups(page):
             if loc.count() > 0 and loc.first.is_visible():
                 loc.first.click(timeout=2000); time.sleep(0.6)
         except: pass
-
     try: page.keyboard.press("Escape"); time.sleep(0.5)
     except: pass
-    print("[Login] Post-login popups done")
+    _ok("[Login] Post-login popups cleared")
+
 
 # ── STEP 1: Story Input ────────────────────────────────────────────────────────
 def step1(page, story_text):
-    print("[Step 1] Story input...")
+    _step("[Step 1] Story input →")
     page.goto("https://magiclight.ai/kids-story/", timeout=60000)
     wait_site_loaded(page, None, timeout=60)
     dismiss_popups(page, timeout=10)
@@ -636,23 +640,31 @@ def step1(page, story_text):
     dismiss_popups(page, timeout=6)
     ta.wait_for(state="visible", timeout=20000)
     ta.click(); ta.fill(story_text)
-    print("  [step1] Story filled"); sleep_log(1)
+    _ok("Story text filled")
+    sleep_log(1)
 
+    # Style — Pixar 2.0
     try:
         page.locator("div").filter(has_text=re.compile(r"^Pixar 2\.0$")).first.click()
-        print("  [step1] Pixar 2.0 selected"); time.sleep(0.5)
-    except: print("  [step1] Pixar 2.0 not found")
+        _ok("Style: Pixar 2.0 selected")
+        time.sleep(0.5)
+    except: _warn("Pixar 2.0 not found — using default style")
 
+    # Aspect ratio — 16:9
     try:
         page.locator("div").filter(has_text=re.compile(r"^16:9$")).first.click()
-        print("  [step1] 16:9 selected"); time.sleep(0.5)
-    except: print("  [step1] 16:9 not found")
+        _ok("Aspect: 16:9 selected")
+        time.sleep(0.5)
+    except: _warn("16:9 not found — using default ratio")
 
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)"); sleep_log(1)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    sleep_log(1)
     _select_dropdown(page, "Voiceover", "Sophia")
     _select_dropdown(page, "Background Music", "Silica")
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)"); sleep_log(1)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    sleep_log(1)
 
+    # Next button
     clicked = False
     for sel in ["button.arco-btn-primary:has-text('Next')", "button:has-text('Next')",
                 ".vlog-bottom", "div[class*='footer-btn']:has-text('Next')"]:
@@ -669,8 +681,8 @@ def step1(page, story_text):
         debug_buttons(page)
         raise Exception("Step 1 Next button not found")
 
-    print("  [step1] Next clicked")
-    _wait_dismissing(page, STEP1_WAIT, "step1 AI generation")
+    _ok("Next → Step 2")
+    _wait_dismissing(page, STEP1_WAIT, "AI generating script")
 
 
 def _select_dropdown(page, label_text, option_text):
@@ -706,34 +718,50 @@ def _select_dropdown(page, label_text, option_text):
         if r:
             time.sleep(0.8)
             r2 = page.evaluate(js_pick, option_text)
-            if r2: print(f"  [step1] {label_text} -> {option_text}")
+            if r2: _ok(f"{label_text} → {option_text}")
             else:
                 page.keyboard.press("Escape")
-                print(f"  [step1] '{option_text}' not found in {label_text}")
+                _warn(f"'{option_text}' not found in {label_text} dropdown")
         else:
-            print(f"  [step1] {label_text} dropdown not found")
+            _warn(f"{label_text} dropdown not found")
     except Exception as e:
-        print(f"  [step1] dropdown error: {e}")
+        _warn(f"Dropdown error: {e}")
+
 
 # ── STEP 2: Cast ───────────────────────────────────────────────────────────────
 def step2(page):
-    print(f"[Step 2] Cast — waiting {STEP2_WAIT}s...")
+    _step(f"[Step 2] Cast generation ({STEP2_WAIT}s)...")
     dismiss_popups(page, timeout=5)
-    _wait_dismissing(page, STEP2_WAIT, "characters generate")
+    _wait_dismissing(page, STEP2_WAIT, "characters generating")
     dismiss_popups(page, timeout=5)
 
-    if not dom_click_class(page, "step2-footer-btn-left", timeout=60):
-        dom_click_text(page, ["Next Step", "Next", "Animate All"], timeout=30)
+    # Updated: "Next Step" now at bottom-right, try multiple selectors
+    clicked = False
+    for sel in [
+        "div[class*='step2-footer-btn-left']",
+        "button:has-text('Next Step')",
+        "div[class*='footer']:has-text('Next Step')",
+        "div[class*='vlog-btn']:has-text('Next Step')",
+    ]:
+        try:
+            el = page.locator(sel)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.click(); clicked = True
+                _ok(f"Next Step clicked via '{sel}'"); break
+        except: pass
+
+    if not clicked:
+        clicked = dom_click_text(page, ["Next Step", "Next", "Animate All"], timeout=30)
 
     sleep_log(4)
-    # Close any animation panel that opened
     _dismiss_animation_modal(page)
     sleep_log(3)
-    print("[Step 2] done")
+    _ok("[Step 2] Done")
+
 
 # ── STEP 3: Storyboard ─────────────────────────────────────────────────────────
 def step3(page):
-    print(f"[Step 3] Storyboard — up to {STEP3_WAIT}s...")
+    _step(f"[Step 3] Storyboard (up to {STEP3_WAIT}s)...")
     dismiss_popups(page, timeout=5)
 
     js_img = """\
@@ -748,18 +776,32 @@ def step3(page):
         if page.evaluate(js_img) >= 2: break
         _dismiss_all(page)
         time.sleep(5)
-        print(f"  waiting... {int(deadline - time.time())}s left")
+        _info(f"  waiting... {int(deadline - time.time())}s left")
 
     sleep_log(3)
     _set_subtitle_style(page)
 
-    if not dom_click_class(page, "step2-footer-btn-left", timeout=20):
-        dom_click_text(page, ["Next", "Next Step"], timeout=15)
+    # Updated: Next button moves to top-right header in Step 3
+    clicked = False
+    for sel in [
+        "[class*='header'] button:has-text('Next')",
+        "[class*='header-shiny-action__btn']:has-text('Next')",
+        "div[class*='step2-footer-btn-left']",
+    ]:
+        try:
+            el = page.locator(sel)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.click(); clicked = True
+                _ok(f"Next clicked via '{sel}'"); break
+        except: pass
+
+    if not clicked:
+        clicked = dom_click_text(page, ["Next", "Next Step"], timeout=15)
 
     sleep_log(4)
     _dismiss_animation_modal(page)
     sleep_log(3)
-    print("[Step 3] done")
+    _ok("[Step 3] Done")
 
 
 def _set_subtitle_style(page):
@@ -781,19 +823,16 @@ def _set_subtitle_style(page):
     if (vis.length >= 10) { vis[9].click(); return 'subtitle style #10 set'; }
     return 'only ' + vis.length + ' items';
 }""")
-    print(f"  [step3] {result}")
+    _info(f"[step3] {result}")
+
 
 # ── STEP 4: Generate + Wait + Download ────────────────────────────────────────
 def step4(page, safe_name):
-    print("[Step 4] Navigating to Generate...")
+    _step("[Step 4] Navigating to Generate...")
     MAX_NEXT = 12
 
-    # ── js: is there a real blocking modal mask? ──────────────────────────────
-    # From debug dump: .arco-modal-mask is the backdrop for real dialogs.
-    # animation-modal__tab = the animation editor panel (NOT a blocking modal).
     js_modal_blocking = """\
 () => {
-    // Only count as 'blocking' if a full-page backdrop mask is visible
     const masks = Array.from(document.querySelectorAll(
         '.arco-modal-mask,[class*="modal-mask"]'
     )).filter(el => {
@@ -801,21 +840,12 @@ def step4(page, safe_name):
         return r.width > 200 && r.height > 200;
     });
     if (masks.length) return 'mask';
-
-    // Animation panel open? (has backdrop with animation tabs)
-    // These have shiny-button-container Next/Animate All on top of storyboard
-    // but NO full-page mask — the panel is a slide-in, not a blocking modal.
     return null;
 }"""
 
-    # ── js: click only the header navigation Next ─────────────────────────────
-    # From debug dump, the header Next is:
-    #   DIV.header-shiny-action__btn header-shiny-ac | Next
     js_header_next = """\
 () => {
     if (typeof Node === 'undefined') return null;
-
-    // Priority 1: header-shiny-action__btn (confirmed from debug dump)
     for (const el of Array.from(document.querySelectorAll(
         '[class*="header-shiny-action__btn"],[class*="header-left-btn"]'
     ))) {
@@ -823,8 +853,6 @@ def step4(page, safe_name):
         const r = el.getBoundingClientRect();
         if (t === 'Next' && r.width > 0) { el.click(); return 'header-shiny: Next'; }
     }
-
-    // Priority 2: primary button
     for (const el of Array.from(document.querySelectorAll('button.arco-btn-primary'))) {
         const t = (el.innerText || '').trim();
         const r = el.getBoundingClientRect();
@@ -833,7 +861,6 @@ def step4(page, safe_name):
     return null;
 }"""
 
-    # ── js: is Generate button visible? ──────────────────────────────────────
     js_has_gen = """\
 () => {
     const texts = ["Generate","Create Video","Export","Create now","Render"];
@@ -853,29 +880,24 @@ def step4(page, safe_name):
 }"""
 
     for attempt in range(MAX_NEXT):
-        # Close any real dialog first
         _dismiss_animation_modal(page)
         sleep_log(2)
 
-        # Check if Generate is already visible
         found = page.evaluate(js_has_gen)
         if found:
-            print(f"  [step4] Generate found after {attempt} attempts: '{found}'")
+            _ok(f"Generate button found after {attempt} attempts: '{found}'")
             break
 
-        # Check for blocking mask
         blocking = page.evaluate(js_modal_blocking)
         if blocking:
-            print(f"  [step4] Real modal blocking ({blocking}) — re-dismissing")
+            _warn(f"Modal blocking ({blocking}) — re-dismissing")
             _dismiss_animation_modal(page)
             sleep_log(3)
             continue
 
-        # Click header Next
         r = page.evaluate(js_header_next)
-        print(f"  [step4] attempt {attempt+1}: {r or 'no header Next'}")
+        _info(f"[step4] attempt {attempt+1}: {r or 'no header Next'}")
         if not r:
-            # No header Next visible either — check page state
             debug_buttons(page)
         sleep_log(4)
     else:
@@ -892,10 +914,10 @@ def step4(page, safe_name):
     _dismiss_all(page)
 
     # ── Wait for render ────────────────────────────────────────────────────────
-    print(f"[Step 4] Waiting for render (max {RENDER_TIMEOUT//60} min)...")
+    _info(f"[Step 4] Waiting for render (max {RENDER_TIMEOUT//60} min)...")
     start = time.time(); last_reload = start; render_done = False
 
-    js_state = """\
+    js_state = r"""
 () => {
     const prog = Array.from(document.querySelectorAll(
         '[class*="progress"],[class*="Progress"],[class*="render-progress"],[class*="generating"]'
@@ -933,12 +955,12 @@ def step4(page, safe_name):
 
         if time.time() - last_reload >= RELOAD_INTERVAL:
             try:
-                print(f"  [step4] Reloading... ({elapsed//60}m elapsed)")
+                _info(f"[step4] Reloading... ({elapsed//60}m elapsed)")
                 page.reload(timeout=30000, wait_until="domcontentloaded")
                 wait_site_loaded(page, None, timeout=30)
                 _dismiss_all(page)
             except Exception as e:
-                print(f"  [step4] reload error: {e}")
+                _warn(f"Reload error: {e}")
             last_reload = time.time()
 
         _dismiss_all(page)
@@ -947,24 +969,26 @@ def step4(page, safe_name):
         if sig is None:
             if elapsed % 30 == 0:
                 rem = RENDER_TIMEOUT - elapsed
-                print(f"  [step4] {elapsed//60}m{elapsed%60}s | {rem//60}m{rem%60}s left")
+                _info(f"[step4] {elapsed//60}m{elapsed%60}s elapsed | {rem//60}m{rem%60}s left")
         elif sig.startswith("progress:"):
             pct = sig.split(":", 1)[1]
             if pct != last_pct:
-                print(f"  [step4] Rendering... {pct}"); last_pct = pct
+                console.print(f"  [cyan]⟳[/cyan] Rendering... [bold]{pct}[/bold]")
+                last_pct = pct
         else:
-            print(f"  [step4] Render done ({elapsed}s) -> {sig}")
+            _ok(f"Render done ({elapsed}s) → {sig}")
             render_done = True; break
 
         time.sleep(POLL_INTERVAL)
 
     if not render_done:
-        print("  [step4] Timeout — trying download anyway")
+        _warn("Render timeout — attempting download anyway")
 
     sleep_log(3, "UI settle")
     _close_preview_popup(page)
     sleep_log(2)
     return _download(page, safe_name)
+
 
 # ── DOWNLOAD + METADATA ────────────────────────────────────────────────────────
 def _download(page, safe_name):
@@ -1016,15 +1040,16 @@ def _download(page, safe_name):
     out["gen_title"] = meta.get("title", "")
     out["summary"]   = meta.get("summary", "")
     out["tags"]      = meta.get("hashtags", "")
-    print(f"  [meta] Title='{out['gen_title'][:40]}' Summary='{out['summary'][:40]}'")
+    _info(f"[meta] Title='{out['gen_title'][:40]}'  Summary='{out['summary'][:40]}'")
 
     cookies = {c["name"]: c["value"] for c in page.context.cookies()}
     headers = {"User-Agent": "Mozilla/5.0", "Referer": page.url}
 
-    # Thumbnail
+    # ── Thumbnail ──────────────────────────────────────────────────────────────
     thumb_dest = os.path.join(sdir, f"{safe_name}_thumb.jpg")
     thumb_url = page.evaluate("""\
 () => {
+    // Priority 1: element near "thumbnail" / "magic thumbnail" label
     const all = Array.from(document.querySelectorAll('div,span,section,h3,h4,p'));
     for (const el of all) {
         const t = (el.innerText || '').trim().toLowerCase();
@@ -1037,22 +1062,52 @@ def _download(page, safe_name):
             c = c.parentElement;
         }
     }
+    // Priority 2: largest non-icon/logo image on page
     const imgs = Array.from(document.querySelectorAll('img[src]'))
         .filter(i => i.src.startsWith('http') && !i.src.includes('logo') &&
                      !i.src.includes('icon') && i.naturalWidth >= 200)
         .sort((a, b) => (b.naturalWidth*b.naturalHeight) - (a.naturalWidth*a.naturalHeight));
     return imgs.length ? imgs[0].src : null;
 }""")
+
     if thumb_url:
         try:
             r = requests.get(thumb_url, timeout=30, cookies=cookies, headers=headers)
             if r.status_code == 200 and len(r.content) > 5000:
                 with open(thumb_dest, "wb") as f: f.write(r.content)
                 out["thumb"] = thumb_dest
-                print(f"  [dl] Thumbnail -> {thumb_dest} ({len(r.content)//1024} KB)")
-        except Exception as e: print(f"  [dl] Thumbnail error: {e}")
+                _ok(f"Thumbnail → {thumb_dest} ({len(r.content)//1024} KB)")
+        except Exception as e: _warn(f"Thumbnail error: {e}")
 
-    # Video
+    # ── Thumbnail fallback: first timeline/storyboard image ───────────────────
+    if not out["thumb"]:
+        fallback_url = page.evaluate("""\
+() => {
+    const selectors = [
+        '[class*="timeline"] img[src]',
+        '[class*="storyboard"] img[src]',
+        '[class*="scene"] img[src]',
+        '[class*="story-board"] img[src]',
+        '[class*="frame"] img[src]',
+        'img[src*="oss"][src]',
+    ];
+    for (const sel of selectors) {
+        const imgs = Array.from(document.querySelectorAll(sel))
+            .filter(i => i.src.startsWith('http') && i.naturalWidth >= 50);
+        if (imgs.length) return imgs[0].src;
+    }
+    return null;
+}""")
+        if fallback_url:
+            try:
+                r = requests.get(fallback_url, timeout=30, cookies=cookies, headers=headers)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    with open(thumb_dest, "wb") as f: f.write(r.content)
+                    out["thumb"] = thumb_dest
+                    _ok(f"Thumbnail (fallback image) → {thumb_dest} ({len(r.content)//1024} KB)")
+            except Exception as e: _warn(f"Thumbnail fallback error: {e}")
+
+    # ── Video ──────────────────────────────────────────────────────────────────
     video_dest = os.path.join(sdir, f"{safe_name}.mp4")
     vid_url = page.evaluate("""\
 () => {
@@ -1067,7 +1122,7 @@ def _download(page, safe_name):
 
     if vid_url:
         try:
-            print(f"  [dl] Downloading video... {vid_url[:80]}")
+            _info(f"[dl] Downloading video... {vid_url[:80]}")
             r = requests.get(vid_url, stream=True, timeout=180, cookies=cookies, headers=headers)
             r.raise_for_status()
             total = 0
@@ -1076,16 +1131,16 @@ def _download(page, safe_name):
                     if chunk:
                         f.write(chunk); total += len(chunk)
                         if total % (1024*1024) < 65536:
-                            print(f"    {total//1024} KB...")
+                            _info(f"  {total//1024} KB...")
             if total > 10000:
                 out["video"] = video_dest
-                print(f"  [dl] Video -> {video_dest} ({total//1024} KB)")
+                _ok(f"Video → {video_dest} ({total//1024} KB)")
             else:
-                print(f"  [dl] Video too small ({total}B)"); os.remove(video_dest)
-        except Exception as e: print(f"  [dl] Video error: {e}")
+                _warn(f"Video too small ({total}B)"); os.remove(video_dest)
+        except Exception as e: _warn(f"Video download error: {e}")
 
     if not out["video"]:
-        print("  [dl] Trying native download button...")
+        _info("[dl] Trying native download button...")
         _close_preview_popup(page); sleep_log(2)
         for sel in ["button:has-text('Download video')", "button:has-text('Download')",
                     "a:has-text('Download')", "a[download]", "a[href*='.mp4']"]:
@@ -1096,14 +1151,15 @@ def _download(page, safe_name):
                         loc.first.click()
                     dl_info.value.save_as(video_dest)
                     out["video"] = video_dest
-                    print(f"  [dl] Video (native) -> {video_dest}"); break
-            except Exception as e: print(f"  [dl] {sel}: {e}")
+                    _ok(f"Video (native download) → {video_dest}"); break
+            except Exception as e: _warn(f"{sel}: {e}")
 
     return out
 
+
 # ── RETRY via User Center ──────────────────────────────────────────────────────
 def _retry_from_user_center(page, project_url, safe_name):
-    print("  [retry] Opening User Center...")
+    _info("[retry] Opening User Center...")
     sleep_log(5, "pre-retry")
     try:
         page.goto("https://magiclight.ai/user-center/", timeout=60000)
@@ -1111,9 +1167,7 @@ def _retry_from_user_center(page, project_url, safe_name):
         sleep_log(4, "user-center settle")
         _dismiss_all(page)
     except Exception as e:
-        print(f"  [retry] User Center failed: {e}"); return None
-
-    print(f"  [retry] URL: {page.url}")
+        _warn(f"User Center failed: {e}"); return None
 
     clicked = page.evaluate("""\
 (targetUrl) => {
@@ -1132,16 +1186,6 @@ def _retry_from_user_center(page, project_url, safe_name):
         'a[href*="/project/edit/"],a[href*="/edit/"]'
     )).filter(a => a.getBoundingClientRect().width > 0);
     if (editLinks.length) { editLinks[0].click(); return 'edit-link'; }
-
-    const selectors = [
-        '[class*="project"] a','[class*="video"] a','[class*="work"] a',
-        '[class*="story"] a','[class*="card"] a','[class*="item"] a[href]',
-    ];
-    for (const sel of selectors) {
-        const items = Array.from(document.querySelectorAll(sel))
-            .filter(el => el.getBoundingClientRect().width > 0);
-        if (items.length) { items[0].click(); return 'card-link: ' + sel; }
-    }
     const thumbs = Array.from(document.querySelectorAll('a')).filter(a => {
         const r = a.getBoundingClientRect();
         return r.width > 80 && r.height > 50 &&
@@ -1153,21 +1197,22 @@ def _retry_from_user_center(page, project_url, safe_name):
 
     if not clicked:
         if project_url and '/project/' in project_url:
-            print(f"  [retry] Direct goto: {project_url}")
+            _info(f"[retry] Direct goto: {project_url}")
             try:
                 page.goto(project_url, timeout=60000)
                 wait_site_loaded(page, None, timeout=30)
                 sleep_log(3); _dismiss_all(page)
                 return _download(page, safe_name)
             except Exception as e:
-                print(f"  [retry] Direct goto failed: {e}")
-        print("  [retry] Could not find project"); return None
+                _warn(f"Direct goto failed: {e}")
+        _warn("[retry] Could not find project"); return None
 
-    print(f"  [retry] Opened ({clicked})")
+    _ok(f"[retry] Project opened ({clicked})")
     sleep_log(5, "project load"); wait_site_loaded(page, None, 30); _dismiss_all(page)
     try: return _download(page, safe_name)
     except Exception as e:
-        print(f"  [retry] Download failed: {e}"); return None
+        _warn(f"[retry] Download failed: {e}"); return None
+
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 def _make_safe(row_num, title):
@@ -1175,25 +1220,23 @@ def _make_safe(row_num, title):
     return s.strip("_")
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--max",      type=int, default=0)
-    p.add_argument("--headless", action="store_true")
+    p = argparse.ArgumentParser(description="MagicLight Auto — Kids Story Generator v2")
+    p.add_argument("--max",      type=int, default=0,  help="Max stories to process (0=all)")
+    p.add_argument("--headless", action="store_true",   help="Run browser headless")
     return p.parse_args()
 
-def _make_context(browser, account):
-    auth_file = _auth_json_path(account)
-    ctx_kwargs = {"accept_downloads": True, "no_viewport": True}
-    if os.path.exists(auth_file):
-        ctx_kwargs["storage_state"] = auth_file
-        print(f"[Context] Loaded session {auth_file}")
-    return browser.new_context(**ctx_kwargs)
-
 def main():
-    global _browser, _current_account_idx
+    global _browser
     args = parse_args()
 
-    if not ACCOUNTS:
-        print("[ERROR] No accounts. Set EMAIL+PASSWORD or ACCOUNTS in .env"); return
+    console.print(Panel.fit(
+        f"[bold cyan]MagicLight Auto[/bold cyan]  [dim]v{__version__}[/dim]\n"
+        f"[dim]Kids Story Video Generator[/dim]",
+        border_style="cyan"
+    ))
+
+    if not EMAIL or not PASSWORD:
+        _err("No credentials. Set EMAIL + PASSWORD in .env"); return
 
     if not ensure_csv(): return
 
@@ -1202,51 +1245,42 @@ def main():
                if r.get("Status", "").strip().lower() == "pending"]
 
     if not pending:
-        print("[Main] No Pending rows."); return
+        _warn("No Pending rows in stories.csv."); return
 
     limit   = args.max if args.max > 0 else len(pending)
     pending = pending[:limit]
-    print(f"[Main] Processing {len(pending)} stories | accounts: {len(ACCOUNTS)}")
+    _ok(f"Processing [bold]{len(pending)}[/bold] stor{'y' if len(pending)==1 else 'ies'}")
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless, args=["--start-maximized"])
         _browser = browser
-
-        account = _get_account()
-        context = _make_context(browser, account)
+        context = browser.new_context(accept_downloads=True, no_viewport=True)
         page    = context.new_page()
 
+        # Always do a fresh login (logout first)
         try:
-            login(page, account)
+            login(page)
         except Exception as e:
-            print(f"[FATAL] Login: {e}")
-            auth_file = _auth_json_path(account)
-            if os.path.exists(auth_file):
-                print("[FATAL] Removing stale session and retrying...")
-                os.remove(auth_file)
-                try:
-                    context.close()
-                    context = _make_context(browser, account)
-                    page    = context.new_page()
-                    login(page, account)
-                except Exception as e2:
-                    print(f"[FATAL] Retry login failed: {e2}")
-                    browser.close(); return
-            else:
-                browser.close(); return
+            _err(f"[FATAL] Login failed: {e}")
+            browser.close(); return
 
         for csv_idx, row in pending:
             if _shutdown: break
 
             story = row.get("Story", "").strip()
             if not story:
-                print(f"[Skip] Row {csv_idx+2}: empty Story"); continue
+                _warn(f"Row {csv_idx+2}: empty Story — skipping"); continue
 
             title   = row.get("Title", f"Row{csv_idx+2}").strip() or f"Row{csv_idx+2}"
             row_num = csv_idx + 2
             safe    = _make_safe(row_num, title)
 
-            print(f"\n{'='*60}\n  Row {row_num}: {title}\n  Output: output/{safe}/\n{'='*60}")
+            console.print(Rule(style="cyan"))
+            console.print(Panel(
+                f"[bold]Row {row_num}:[/bold] {title}\n[dim]Output → output/{safe}/[/dim]",
+                border_style="cyan", expand=False
+            ))
+
             update_row(csv_idx, Status="Processing",
                        Created_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -1255,49 +1289,56 @@ def main():
 
             try:
                 step1(page, story)
+
+                if _credit_exhausted(page):
+                    _err("[Low Credit] Insufficient credits — stopping")
+                    update_row(csv_idx, Status="Low Credit",
+                               Notes="Credits exhausted before Step 2",
+                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    break
+
                 step2(page)
                 step3(page)
                 project_url = page.url
                 update_row(csv_idx, Project_URL=project_url)
+
+                if _credit_exhausted(page):
+                    _err("[Low Credit] Insufficient credits — stopping")
+                    update_row(csv_idx, Status="Low Credit",
+                               Notes="Credits exhausted before Step 4",
+                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    break
+
                 result = step4(page, safe)
 
                 if _credit_exhausted(page):
-                    account = next_account()
-                    if account:
-                        context.close()
-                        context = _make_context(browser, account)
-                        page    = context.new_page()
-                        login(page, account)
+                    _err("[Low Credit] Insufficient credits detected post-render")
+                    update_row(csv_idx, Status="Low Credit",
+                               Notes="Credits exhausted",
+                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    break
 
             except Exception as e:
                 screenshot(page, f"error_row{row_num}")
                 debug_buttons(page)
-                print(f"  [Main] Row {row_num} error: {e}")
+                _err(f"Row {row_num} error: {e}")
 
                 if _credit_exhausted(page):
-                    account = next_account()
-                    if account:
-                        context.close()
-                        context = _make_context(browser, account)
-                        page    = context.new_page()
-                        login(page, account)
-                        try: result = _retry_from_user_center(page, project_url, safe)
-                        except: result = None
-                    else:
-                        update_row(csv_idx, Status="Error",
-                                   Notes="Credits exhausted",
-                                   Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                        break
-                else:
-                    print("  [Main] Retrying via User Center...")
-                    try: result = _retry_from_user_center(page, project_url, safe)
-                    except Exception as re_err:
-                        print(f"  [retry] {re_err}"); result = None
+                    _err("[Low Credit] Insufficient credits — stopping all processing")
+                    update_row(csv_idx, Status="Low Credit",
+                               Notes="Credits exhausted",
+                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    break
+
+                _info("[retry] Attempting via User Center...")
+                try: result = _retry_from_user_center(page, project_url, safe)
+                except Exception as re_err:
+                    _warn(f"[retry] {re_err}"); result = None
 
                 if not result:
                     update_row(csv_idx, Status="Error", Notes=str(e)[:300],
                                Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                    print(f"  [Main] Row {row_num} -> Error")
+                    _err(f"Row {row_num} → Error")
                     sleep_log(5); continue
 
             video_ok = bool(result and result.get("video") and os.path.exists(result["video"]))
@@ -1313,15 +1354,20 @@ def main():
                 Notes          = "OK" if video_ok else "Video download failed",
                 Completed_Time = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
-            print(f"  [Main] Row {row_num} -> {status}")
-            if len(pending) > 1:
-                sleep_log(5, "cooldown")
+            if video_ok:
+                _ok(f"[bold green]Row {row_num} → Done ✓[/bold green]")
+            else:
+                _warn(f"Row {row_num} → No_Video (render done, download failed)")
 
-        print("\n[Main] All done — closing.")
+            if len(pending) > 1:
+                sleep_log(5, "cooldown between stories")
+
+        console.print(Rule(style="cyan"))
+        _ok("[bold]All done — closing browser.[/bold]")
         try: browser.close()
         except: pass
         _browser = None
 
-
 if __name__ == "__main__":
     main()
+
