@@ -84,9 +84,10 @@ load_dotenv()
 EMAIL    = os.getenv("EMAIL", "")
 PASSWORD = os.getenv("PASSWORD", "")
 
-SHEET_ID   = os.getenv("SHEET_ID",   "1MPfnJ2UajI-eKKqGS4y6eb3BEgXpJiZ44nr556cfXRE")
-SHEET_NAME = os.getenv("SHEET_NAME", "Database")
-CREDS_JSON = os.getenv("CREDS_JSON", "credentials.json")
+SHEET_ID        = os.getenv("SHEET_ID",   "1MPfnJ2UajI-eKKqGS4y6eb3BEgXpJiZ44nr556cfXRE")
+SHEET_NAME      = os.getenv("SHEET_NAME", "Database")
+CREDS_JSON      = os.getenv("CREDS_JSON", "credentials.json")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
 
 STEP1_WAIT     = int(os.getenv("STEP1_WAIT",            "60"))
 STEP2_WAIT     = int(os.getenv("STEP2_WAIT",            "30"))
@@ -174,6 +175,27 @@ def update_sheet_row(sheet_row_num, **kw):
                 _ws.update_cell(sheet_row_num, new_col, str(value) if value else "")
             except Exception as e:
                 _warn(f"[sheet] add_col({col_name}): {e}")
+
+def upload_to_drive(file_path):
+    if not DRIVE_FOLDER_ID or not os.path.exists(file_path): return ""
+    _info(f"[drive] Uploading {os.path.basename(file_path)} to Drive...")
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.http import MediaFileUpload
+        
+        creds = Credentials.from_service_account_file(
+            CREDS_JSON, scopes=['https://www.googleapis.com/auth/drive.file']
+        )
+        service = build('drive', 'v3', credentials=creds)
+        file_metadata = {'name': os.path.basename(file_path), 'parents': [DRIVE_FOLDER_ID]}
+        media = MediaFileUpload(file_path, resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        link = file.get('webViewLink')
+        _ok(f"[drive] Uploaded -> {link}")
+        return link
+    except Exception as e:
+        _warn(f"[drive] Upload failed: {e}"); return ""
 
 def story_dir(safe_name):
     d = os.path.join(OUT_BASE, safe_name)
@@ -1172,8 +1194,8 @@ def _download(page, safe_name):
     video_dest = os.path.join(sdir, f"{safe_name}.mp4")
 
     # ── Wait for video to appear on the page ──────────────────────────────────
-    _info("[dl] Waiting for video element on page...")
-    vid_wait_deadline = time.time() + 30
+    _info("[dl] Waiting for video element on page (max 60s)...")
+    vid_wait_deadline = time.time() + 60
     while time.time() < vid_wait_deadline:
         vid_check = page.evaluate("""\
 () => {
@@ -1254,6 +1276,14 @@ def _download(page, safe_name):
 
     if not out["video"]:
         _err("[dl] VIDEO DOWNLOAD FAILED — marking as No_Video")
+    
+    # ── Drive Upload ────────────────────────────────────────────────────────
+    if out.get("video") and DRIVE_FOLDER_ID:
+        try:
+            link = upload_to_drive(out["video"])
+            if link: out["drive_link"] = link
+        except Exception as e:
+            _warn(f"Drive upload error: {e}")
 
     return out
 
@@ -1381,15 +1411,15 @@ def main():
             if _shutdown: break
 
             vals = list(row.values())
-            # Col D (idx 3), Col E (idx 4), Col F (idx 5)
+            # Col C (idx 2, Title), Col D (idx 3, Story), Col E (idx 4, Moral)
+            col_c = str(vals[2]).strip() if len(vals) > 2 else ""
             col_d = str(vals[3]).strip() if len(vals) > 3 else ""
             col_e = str(vals[4]).strip() if len(vals) > 4 else ""
-            col_f = str(vals[5]).strip() if len(vals) > 5 else ""
             
-            story = f"{col_d}\n\n{col_e}\n\n{col_f}".strip()
+            story = f"{col_c}\n\n{col_d}\n\n{col_e}".strip()
             
             if not story:
-                _warn(f"Row {rec_idx+2}: empty Story (Cols D,E,F) — skipping"); continue
+                _warn(f"Row {rec_idx+2}: empty Story (Cols C,D,E) — skipping"); continue
 
             title   = str(row.get("Title", f"Row{rec_idx+2}")).strip() or f"Row{rec_idx+2}"
             row_num = rec_idx + 2          # sheet row (1=header, 2=first data)
@@ -1464,17 +1494,19 @@ def main():
 
             video_ok = bool(result and result.get("video") and os.path.exists(result["video"]))
             status   = "Done" if video_ok else "No_Video"
-            update_sheet_row(row_num,
-                Status         = status,
-                Gen_Title      = (result or {}).get("gen_title") or title,
-                Summary        = (result or {}).get("summary", ""),
-                Tags           = (result or {}).get("tags", ""),
-                Video_Path     = (result or {}).get("video", ""),
-                Thumb_Path     = (result or {}).get("thumb", ""),
-                Project_URL    = page.url,
-                Notes          = "OK" if video_ok else "Video download failed",
-                Completed_Time = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
+            kw = {
+                "Status": status,
+                "Gen Title": (result or {}).get("gen_title") or title,
+                "Gen Summary": (result or {}).get("summary", ""),
+                "Gen Tags": (result or {}).get("tags", ""),
+                "Video_Path": (result or {}).get("video", ""),
+                "Thumb_Path": (result or {}).get("thumb", ""),
+                "Drive_Link": (result or {}).get("drive_link", ""),
+                "Project_URL": page.url,
+                "Notes": "OK" if video_ok else "Video download failed",
+                "Completed_Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            update_sheet_row(row_num, **kw)
             if video_ok:
                 _ok(f"[bold green]Row {row_num} → Done ✓[/bold green]")
             else:

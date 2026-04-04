@@ -2,8 +2,8 @@
 # Copy this file to .env and fill in your credentials
 
 # ── Required ───────────────────────────────────────────────────────────────────
-EMAIL=your@email.com
-PASSWORD=yourpassword
+EMAIL=yelex73874@nexafilm.com
+PASSWORD=kxyYA3SzfJg@sfx
 
 # ── Google Sheets / Drive ────────────────────────────────────────────────────────
 # Sheet ID from the URL: .../spreadsheets/d/{SHEET_ID}/edit
@@ -14,7 +14,7 @@ CREDS_JSON=credentials.json
 
 # (Optional) Google Drive Folder ID to upload the video + thumbnail
 # The folder must be shared with the Service Account email!
-DRIVE_FOLDER_ID=
+DRIVE_FOLDER_ID=1n0yMdwrrB1BJfGQgyvY0Qf1aFiHiX-16
 
 # ── Timing (seconds) — increase on slow connections ───────────────────────────
 STEP1_WAIT=60
