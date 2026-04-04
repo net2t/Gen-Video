@@ -352,31 +352,76 @@ def _dismiss_animation_modal(page):
     try: page.keyboard.press("Escape"); time.sleep(0.5)
     except: pass
 
+def _wait_for_preview_page(page, timeout=60):
+    """
+    Wait until the final preview page (with Title/Summary/Download) is loaded.
+    Returns True if the preview panel is found.
+    """
+    _info("[post-render] Waiting for preview page to load...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _shutdown: return False
+        found = page.evaluate("""\
+() => {
+    const items = document.querySelectorAll('.previewer-new-body-right-item');
+    const dlBtn = Array.from(document.querySelectorAll('button,a')).find(el => {
+        const t = (el.innerText || '').trim();
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && (t === 'Download video' || t === 'Download Video');
+    });
+    if (items.length > 0 || dlBtn) return true;
+    return false;
+}""")
+        if found:
+            _ok("Preview page loaded")
+            return True
+        time.sleep(2)
+    _warn("Preview page did not load in time")
+    return False
+
+
 def _handle_generated_popup(page):
     """
     After render: handles 'Your work ... has been generated' popup.
-    Clicks Submit (required to unlock download), waits, then clicks Download video.
+    1. Click Submit (unlocks download)
+    2. Wait for preview page to fully load
+    3. Click Download video
     Returns True if Download video was triggered.
     """
     _info("[post-render] Checking for generated popup...")
-    # Click Submit on "has been generated" modal
-    for sel in ["button:has-text('Submit')", "button.arco-btn:has-text('Submit')"]:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible(timeout=3000):
-                loc.first.click()
-                _ok("Submit clicked on generated popup")
-                sleep_log(3, "post-submit")
-                break
-        except: pass
 
-    # Now click "Download video" in header
-    for _ in range(5):
+    # Click Submit — wait up to 15s for it to appear
+    submitted = False
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        for sel in [
+            "button:has-text('Submit')",
+            "button.arco-btn:has-text('Submit')",
+            ".arco-modal button:has-text('Submit')",
+        ]:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click()
+                    _ok("Submit clicked on generated popup")
+                    submitted = True; break
+            except: pass
+        if submitted: break
+        time.sleep(2)
+
+    if submitted:
+        sleep_log(4, "post-submit settle")
+        # Wait for the preview page with Download video button
+        _wait_for_preview_page(page, timeout=30)
+
+    # Click Download video — wait up to 30s
+    dl_deadline = time.time() + 30
+    while time.time() < dl_deadline:
         for sel in [
             "button:has-text('Download video')",
             "a:has-text('Download video')",
             "button:has-text('Download Video')",
-            "[class*='download']:has-text('Download')",
+            "a:has-text('Download Video')",
         ]:
             try:
                 loc = page.locator(sel)
@@ -386,6 +431,8 @@ def _handle_generated_popup(page):
                     return True
             except: pass
         time.sleep(2)
+
+    _warn("[post-render] Download video button not found after waiting")
     return False
 
 # ── DOM helpers ────────────────────────────────────────────────────────────────
@@ -991,9 +1038,21 @@ def step4(page, safe_name):
         _warn("Render timeout — attempting download anyway")
 
     sleep_log(3, "UI settle")
-    # Handle the "has been generated" popup → click Submit → Download video
-    _handle_generated_popup(page)
-    sleep_log(3)
+
+    # ── Handle the post-render popup first (Submit → Download video) ──────────
+    # Check if the popup is already showing BEFORE the render wait loop exited
+    popup_visible = page.evaluate("""\
+() => {
+    const body = (document.body && document.body.innerText) || '';
+    return body.includes('has been generated') && body.includes('Submit');
+}""")
+    if popup_visible or render_done:
+        _handle_generated_popup(page)
+        sleep_log(3, "post-submit settle")
+        # Wait for preview page to fully load
+        _wait_for_preview_page(page, timeout=45)
+
+    sleep_log(2)
     return _download(page, safe_name)
 
 
@@ -1096,7 +1155,11 @@ def _download(page, safe_name):
     # ── Video ──────────────────────────────────────────────────────────────────
     video_dest = os.path.join(sdir, f"{safe_name}.mp4")
 
-    vid_url = page.evaluate("""\
+    # ── Wait for video to appear on the page ──────────────────────────────────
+    _info("[dl] Waiting for video element on page...")
+    vid_wait_deadline = time.time() + 30
+    while time.time() < vid_wait_deadline:
+        vid_check = page.evaluate("""\
 () => {
     const v = document.querySelector('video');
     if (v && v.src && v.src.includes('.mp4')) return v.src;
@@ -1106,47 +1169,75 @@ def _download(page, safe_name):
     if (a) return a.href;
     return null;
 }""")
+        if vid_check:
+            _info(f"[dl] Video element found")
+            break
+        time.sleep(2)
 
-    if vid_url:
+    # Primary: native browser download via Download video button
+    _info("[dl] Triggering native Download video button...")
+    for sel in [
+        "button:has-text('Download video')",
+        "a:has-text('Download video')",
+        "button:has-text('Download Video')",
+        "a:has-text('Download Video')",
+        "a[download]",
+        "a[href*='.mp4']",
+    ]:
         try:
-            _info(f"[dl] Downloading video... {vid_url[:80]}")
-            r = requests.get(vid_url, stream=True, timeout=180, cookies=cookies, headers=headers)
-            r.raise_for_status()
-            total = 0
-            with open(video_dest, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    if chunk:
-                        f.write(chunk); total += len(chunk)
-                        if total % (1024*1024) < 65536:
-                            _info(f"  {total//1024} KB...")
-            if total > 10000:
-                out["video"] = video_dest
-                _ok(f"Video → {video_dest} ({total//1024} KB)")
-            else:
-                _warn(f"Video too small ({total}B)"); os.remove(video_dest)
-        except Exception as e: _warn(f"Video download error: {e}")
-
-    # Native download button fallback
-    if not out["video"]:
-        _info("[dl] Trying native Download video button...")
-        sleep_log(2)
-        for sel in [
-            "button:has-text('Download video')",
-            "a:has-text('Download video')",
-            "button:has-text('Download Video')",
-            "button:has-text('Download')",
-            "a[download]",
-            "a[href*='.mp4']",
-        ]:
-            try:
-                loc = page.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible():
-                    with page.expect_download(timeout=120000) as dl_info:
-                        loc.first.click()
-                    dl_info.value.save_as(video_dest)
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                _info(f"[dl] Clicking '{sel}'...")
+                with page.expect_download(timeout=180000) as dl_info:
+                    loc.first.click()
+                dl = dl_info.value
+                dl.save_as(video_dest)
+                if os.path.exists(video_dest) and os.path.getsize(video_dest) > 10000:
                     out["video"] = video_dest
-                    _ok(f"Video (native download) → {video_dest}"); break
-            except Exception as e: _warn(f"  {sel}: {e}")
+                    _ok(f"Video → {video_dest} ({os.path.getsize(video_dest)//1024} KB)")
+                    break
+                else:
+                    _warn(f"Download saved but file too small — retrying")
+        except Exception as e:
+            _warn(f"  {sel}: {e}")
+
+    # Fallback: direct URL download
+    if not out["video"]:
+        vid_url = page.evaluate("""\
+() => {
+    const v = document.querySelector('video');
+    if (v && v.src && v.src.includes('.mp4')) return v.src;
+    const s = document.querySelector('video source');
+    if (s && s.src && s.src.includes('.mp4')) return s.src;
+    const a = document.querySelector('a[href*=".mp4"]');
+    if (a) return a.href;
+    return null;
+}""")
+        if vid_url:
+            try:
+                _info(f"[dl] Direct URL download: {vid_url[:80]}")
+                r = requests.get(vid_url, stream=True, timeout=180,
+                                  cookies=cookies, headers=headers)
+                r.raise_for_status()
+                total = 0
+                with open(video_dest, "wb") as f:
+                    for chunk in r.iter_content(65536):
+                        if chunk:
+                            f.write(chunk); total += len(chunk)
+                            if total % (1024*1024*5) < 65536:
+                                _info(f"  {total//1024//1024} MB...")
+                if total > 10000:
+                    out["video"] = video_dest
+                    _ok(f"Video (URL) → {video_dest} ({total//1024} KB)")
+                else:
+                    _warn(f"Video too small ({total}B)")
+                    try: os.remove(video_dest)
+                    except: pass
+            except Exception as e:
+                _warn(f"Video URL download error: {e}")
+
+    if not out["video"]:
+        _err("[dl] VIDEO DOWNLOAD FAILED — marking as No_Video")
 
     return out
 
