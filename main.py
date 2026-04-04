@@ -184,9 +184,23 @@ def main() -> int:
     count = min(max(count, 0), len(videos))
 
     # Video profile
-    profile = Prompt.ask("Select video profile", choices=["480p", "720p", "1080p"], default="720p")
-    profile_map = {"480p": "480", "720p": "720", "1080p": "1080"}
-    profile_val = profile_map.get(profile, "720")
+    console.print("[bold cyan]Select video profile:[/bold cyan]")
+    console.print("  1. 480p  (YouTube optimized)")
+    console.print("  2. 720p  (YouTube optimized)")
+    console.print("  3. 1080p (YouTube optimized)")
+    console.print("  4. 480p")
+    console.print("  5. 720p")
+    console.print("  6. 1080p")
+    choice = IntPrompt.ask("Enter profile number", default=2)
+    profile_map = {
+        1: ("480", "480p_yt"),
+        2: ("720", "720p_yt"),
+        3: ("1080", "1080p_yt"),
+        4: ("480", "480p"),
+        5: ("720", "720p"),
+        6: ("1080", "1080p"),
+    }
+    profile_val, profile_name = profile_map.get(choice, ("720", "720p_yt"))
 
     # Endscreen
     endscreen = Confirm.ask("Enable endscreen?", default=True)
@@ -213,7 +227,7 @@ def main() -> int:
     # Summary panel
     summary = (
         f"[bold]Videos to process:[/bold] {count}\n"
-        f"[bold]Profile:[/bold] {profile}\n"
+        f"[bold]Profile:[/bold] {profile_name}\n"
         f"[bold]Endscreen:[/bold] {'Yes' if endscreen else 'No'}\n"
         f"[bold]Upload to Drive:[/bold] {'Yes' if upload else 'No'}\n"
         f"[bold]Trim seconds:[/bold] {trim_seconds}\n"
