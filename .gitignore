@@ -15,7 +15,7 @@ output/
 screenshots/
 
 # ── CSV (contains story data — keep template, ignore data) ───────────────────────
-# stories.csv      ← Uncomment this line if you don't want to commit your story data
+stories.csv
 
 # ── Temp / Dev files ─────────────────────────────────────────────────────────────
 inspect_dom.py

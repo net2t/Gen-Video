@@ -1,7 +1,7 @@
 """
 MagicLight Auto — Kids Story Video Generator
 =============================================
-Version : 2.2.0  [FINAL]
+Version : 3.0.0  [FINAL STABLE]
 Released: 2026-04-04
 Repo    : https://github.com/net2t/VideoProcessor
 
@@ -9,8 +9,8 @@ Data Source : Google Sheets  →  "Database" tab
 Output      : output/row{N}_{title}/  (.mp4 + _thumb.jpg)
 
 Usage:
-    python main.py              # Process all Pending rows
-    python main.py --max 2      # Process max 2 stories
+    python main.py              # Interactive menu
+    python main.py --max 2      # Process max 2 stories without prompt
     python main.py --headless   # Run browser headless
 
 Credentials (.env):
@@ -39,7 +39,7 @@ Status values written to Sheet:
 """
 
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 import re
 import os
@@ -1392,6 +1392,18 @@ def main():
     if not pending:
         _warn("No 'Pending' rows found in Sheet."); return
 
+    # Interactive menu
+    if len(sys.argv) == 1:
+        ans = console.input("\n[bold cyan]?[/bold cyan] Enter limit of stories to process (0 for unlimited): ").strip()
+        if ans.isdigit():
+            args.max = int(ans)
+        
+        global DRIVE_FOLDER_ID
+        if not DRIVE_FOLDER_ID:
+            up_drive = console.input("[bold cyan]?[/bold cyan] Upload to Google Drive? (Y/N): ").strip().upper()
+            if up_drive == 'Y':
+                DRIVE_FOLDER_ID = console.input("  [bold cyan]>[/bold cyan] Enter Google Drive Folder ID: ").strip()
+
     limit   = args.max if args.max > 0 else len(pending)
     pending = pending[:limit]
     _ok(f"Processing [bold]{len(pending)}[/bold] stor{'y' if len(pending)==1 else 'ies'}")
@@ -1524,4 +1536,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n\n[bold yellow][STOP] KeyboardInterrupt caught — exiting gracefully...[/bold yellow]")
+        if _browser:
+            try: _browser.close()
+            except: pass
+        import sys
+        sys.exit(0)
