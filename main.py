@@ -895,7 +895,8 @@ def _set_subtitle_style(page):
 # ── STEP 4: Navigate to Generate → Wait → Download ────────────────────────────
 def step4(page, safe_name):
     _step("[Step 4] Navigating to Generate...")
-    MAX_NEXT = 12
+    # Background generation on the site takes time. We wait here until "Next" turns into "Generate".
+    MAX_NEXT = 100
 
     js_modal_blocking = """\
 () => {
