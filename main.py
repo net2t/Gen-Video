@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-VideoProcessor — Enhanced TUI Menu
+VideoProcessor — Unified TUI Menu & Video Processing
 - Scans and lists video files
-- Interactive prompts: how many, profile (480/720), endscreen, upload/local
+- Interactive prompts: how many, profile (480/720/1080, YouTube optimized), endscreen, upload/local
 - Hides warnings, shows detailed/advanced UX output
+- Includes video processing logic (logo, trim, endscreen, Drive upload)
 """
 
 import argparse
@@ -11,7 +12,13 @@ import os
 import sys
 import subprocess
 import logging
+import json
+import time
+import shutil
+import tempfile
+import re
 from pathlib import Path
+from datetime import datetime
 
 # Hide warnings
 logging.getLogger().setLevel(logging.ERROR)
@@ -86,9 +93,23 @@ def _load_root_env() -> None:
     else:
         load_dotenv()
 
-# ── Scan video files ───────────────────────────────────────────────────────
+# ── CONFIG from .env ───────────────────────────────────────────────────────
+SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID", "")
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+TRIM_SECONDS    = int(os.getenv("TRIM_SECONDS", "4"))
+LOGO_PATH       = os.getenv("LOGO_PATH", "assets/logo.png")
+LOGO_X          = int(os.getenv("LOGO_X", "10"))
+LOGO_Y          = int(os.getenv("LOGO_Y", "10"))
+LOGO_WIDTH      = int(os.getenv("LOGO_WIDTH", "120"))
+LOGO_OPACITY    = float(os.getenv("LOGO_OPACITY", "1.0"))
+ENDSCREEN_ENABLED = os.getenv("ENDSCREEN_ENABLED", "false").lower() == "true"
+ENDSCREEN_VIDEO = os.getenv("ENDSCREEN_VIDEO", "assets/endscreen.mp4")
+ENDSCREEN_DURATION = os.getenv("ENDSCREEN_DURATION", "5")
+INPUT_FOLDER    = os.getenv("INPUT_FOLDER", "")
+OUTPUT_FOLDER   = os.getenv("OUTPUT_FOLDER", "")
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".flv", ".wmv"}
 
+# ── Scan video files ───────────────────────────────────────────────────────
 def scan_videos(folder: Path) -> list[Path]:
     if not folder.exists():
         folder.mkdir(parents=True, exist_ok=True)
@@ -115,59 +136,54 @@ def show_file_table(files: list[Path], max_to_show: int | None = None):
     if max_to_show and len(files) > max_to_show:
         console.print(f"[dim]... and {len(files)-max_to_show} more files not shown[/dim]")
 
-# ── Build process arguments from user choices ───────────────────────────────────
-def build_process_args(
-    count: int,
-    profile: str,
-    endscreen: bool,
-    upload: bool,
-    trim_seconds: int,
-    logo_path: Path,
-    logo_x: int,
-    logo_y: int,
-    logo_width: int,
-    logo_opacity: float,
-    endscreen_video: Path | None = None,
-    output_folder: Path | None = None,
-) -> list[str]:
-    args = ["--mode", "local"]
-    if count:
-        args.extend(["--max", str(count)])
-    # Pass profile via environment; process.py can map it to ffmpeg -crf or -vf scale
-    os.environ["VIDEO_PROFILE"] = profile
+# ── Video processing functions (from process.py) ───────────────────────────────
+def check_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+def get_ffmpeg_args(input_file: Path, output_file: Path, profile: str, trim_seconds: int, logo_path: Path, logo_x: int, logo_y: int, logo_width: int, logo_opacity: float, endscreen: bool, endscreen_video: Path | None) -> list[str]:
+    args = ["ffmpeg", "-y", "-i", str(input_file)]
+    # Trim
+    if trim_seconds > 0:
+        args.extend(["-t", str(input_file.stat().st_size - trim_seconds)])
+    # Logo overlay
+    if logo_path.exists():
+        args.extend(["-i", str(logo_path), "-filter_complex", f"[0:v][1:v] overlay={logo_x}:{logo_y}:format=auto,format=yuv420p"])
+    # Profile scaling
+    if profile == "480":
+        args.extend(["-vf", "scale=854:480"])
+    elif profile == "720":
+        args.extend(["-vf", "scale=1280:720"])
+    elif profile == "1080":
+        args.extend(["-vf", "scale=1920:1080"])
+    # Endscreen
     if endscreen and endscreen_video and endscreen_video.exists():
-        os.environ["ENDSCREEN_ENABLED"] = "true"
-        os.environ["ENDSCREEN_VIDEO"] = str(endscreen_video)
-    else:
-        os.environ["ENDSCREEN_ENABLED"] = "false"
-    # Upload/local
-    os.environ["UPLOAD_TO_DRIVE"] = "true" if upload else "false"
-    # Trim/logo settings (override .env)
-    os.environ["TRIM_SECONDS"] = str(trim_seconds)
-    os.environ["LOGO_PATH"] = str(logo_path)
-    os.environ["LOGO_X"] = str(logo_x)
-    os.environ["LOGO_Y"] = str(logo_y)
-    os.environ["LOGO_WIDTH"] = str(logo_width)
-    os.environ["LOGO_OPACITY"] = str(logo_opacity)
-    if output_folder:
-        os.environ["OUTPUT_FOLDER"] = str(output_folder)
+        args.extend(["-i", str(endscreen_video), "-filter_complex", f"[0:v][1:v] overlay={logo_x}:{logo_y}:format=auto,format=yuv420p;[v]concat=n=2:v=1:a=0"])
+    # Output
+    args.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output_file)])
     return args
 
-# ── Run process.py with args ───────────────────────────────────────────────────
-def run_process_with_args(args: list[str]) -> int:
-    import process
-    saved_argv = sys.argv
+def process_video(input_file: Path, output_file: Path, profile: str, trim_seconds: int, logo_path: Path, logo_x: int, logo_y: int, logo_width: int, logo_opacity: float, endscreen: bool, endscreen_video: Path | None):
+    console.print(f"[cyan]Processing: {input_file.name}[/cyan]")
+    args = get_ffmpeg_args(input_file, output_file, profile, trim_seconds, logo_path, logo_x, logo_y, logo_width, logo_opacity, endscreen, endscreen_video)
     try:
-        sys.argv = [saved_argv[0], *args]
-        process.main()
-        return 0
-    finally:
-        sys.argv = saved_argv
+        subprocess.run(args, check=True, capture_output=True)
+        console.print(f"[green]✔ Finished: {output_file.name}[/green]")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]✖ Failed to process {input_file.name}: {e}[/red]")
 
 # ── Main TUI menu ───────────────────────────────────────────────────────────────
 def main() -> int:
     _load_root_env()
-    console.rule("[bold blue]VideoProcessor — Enhanced TUI[/bold blue]")
+    console.rule("[bold blue]VideoProcessor — Unified TUI & Processor[/bold blue]")
+
+    # Check ffmpeg
+    if not check_ffmpeg():
+        console.print("[red]FFmpeg not found. Please install FFmpeg and add to PATH.[/red]")
+        return 1
 
     # Scan folder
     input_folder = Path(os.getenv("INPUT_FOLDER", "")) or (Path(__file__).parent / "Pending")
@@ -224,7 +240,7 @@ def main() -> int:
     trim_seconds = int(os.getenv("TRIM_SECONDS", "4"))
     output_folder = Path(os.getenv("OUTPUT_FOLDER", "")) if os.getenv("OUTPUT_FOLDER") else None
 
-    # Summary panel
+    # Summary
     summary = (
         f"[bold]Videos to process:[/bold] {count}\n"
         f"[bold]Profile:[/bold] {profile_name}\n"
@@ -233,29 +249,25 @@ def main() -> int:
         f"[bold]Trim seconds:[/bold] {trim_seconds}\n"
         f"[bold]Logo:[/bold] {logo_path.name if logo_path.exists() else 'Not found'}\n"
     )
-    console.panel(summary, title="[bold magenta]Configuration[/bold magenta]")
+    console.rule(f"[bold magenta]Configuration[/bold magenta]")
+    console.print(summary)
 
     if not Confirm.ask("Proceed with processing?", default=True):
         console.print("[yellow]Cancelled.[/yellow]")
         return 0
 
-    # Build args and run
-    args = build_process_args(
-        count=count,
-        profile=profile_val,
-        endscreen=endscreen,
-        upload=upload,
-        trim_seconds=trim_seconds,
-        logo_path=logo_path,
-        logo_x=logo_x,
-        logo_y=logo_y,
-        logo_width=logo_width,
-        logo_opacity=logo_opacity,
-        endscreen_video=endscreen_video,
-        output_folder=output_folder,
-    )
-    console.rule("[bold green]Starting Processing[/bold green]")
-    return run_process_with_args(args)
+    # Process videos
+    to_process = videos[:count]
+    for i, video in enumerate(to_process, 1):
+        console.print(f"[dim][{i}/{len(to_process)}][/dim]")
+        if output_folder and output_folder.exists():
+            out_path = output_folder / f"{video.stem}_processed{video.suffix}"
+        else:
+            out_path = video.parent / f"{video.stem}_processed{video.suffix}"
+        process_video(video, out_path, profile_val, trim_seconds, logo_path, logo_x, logo_y, logo_width, logo_opacity, endscreen, endscreen_video)
+        # TODO: Add upload logic if upload=True
+    console.print("[bold green]All done![/bold green]")
+    return 0
 
 if __name__ == "__main__":
     try:

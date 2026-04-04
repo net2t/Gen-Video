@@ -1,9 +1,0 @@
-playwright
-gspread
-oauth2client
-python-dotenv
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-requests
