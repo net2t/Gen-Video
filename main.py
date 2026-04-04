@@ -1,11 +1,12 @@
 """
 MagicLight Auto — Kids Story Video Generator
 =============================================
-Version : 2.0.0
-Released: 2026-04-03
+Version : 2.1.0
+Released: 2026-04-04
 Repo    : https://github.com/net2t/VideoProcessor
 
-CSV: stories.csv  ->  output/row{N}_{title}/
+Data Source : Google Sheets  →  "Database" tab
+Output      : output/row{N}_{title}/  (.mp4 + _thumb.jpg)
 
 Usage:
     python main.py              # Process all Pending rows
@@ -15,29 +16,24 @@ Usage:
 Credentials (.env):
     EMAIL=your@email.com
     PASSWORD=yourpassword
+    SHEET_ID=1MPfnJ2UajI-eKKqGS4y6eb3BEgXpJiZ44nr556cfXRE
+    SHEET_NAME=Database
 
-Status values written to CSV:
+Google Sheets (credentials.json in project root):
+    Service account JSON — share the sheet with the service account email.
+
+Status values written to Sheet:
     Processing  — currently running
     Done        — video downloaded successfully
     No_Video    — render done but video download failed
     Low Credit  — account ran out of credits, stopped
     Error       — unexpected failure
-
-──────────────────────────────────────────────────────────────────────────────
-  STABLE FUNCTIONS — do NOT refactor without full regression test
-──────────────────────────────────────────────────────────────────────────────
-  login()                    — always logs out first, then fresh login
-  _dismiss_animation_modal() — uses .arco-modal-mask as real-dialog signal
-  step4() / js_header_next   — ONLY clicks header-shiny-action__btn for Next
-  _dismiss_all()             — generic banner/popup killer, NOT dialog-aware
-──────────────────────────────────────────────────────────────────────────────
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import re
 import os
-import csv
 import sys
 import time
 import signal
@@ -46,7 +42,7 @@ import argparse
 import requests
 from datetime import datetime
 
-# Suppress noisy deprecation / SSL warnings
+# Suppress noisy warnings
 warnings.filterwarnings("ignore")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
@@ -57,33 +53,24 @@ from playwright.sync_api import sync_playwright
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
-from rich import print as rprint
 
 console = Console(highlight=False)
 
-def _log(msg, style="white"):
-    console.print(msg, style=style)
-
-def _step(label, style="bold cyan"):
-    console.print(f"\n[bold]{label}[/bold]", style=style)
-
-def _ok(msg):
-    console.print(f"  [bold green]✓[/bold green] {msg}")
-
-def _warn(msg):
-    console.print(f"  [bold yellow]⚠[/bold yellow]  {msg}")
-
-def _err(msg):
-    console.print(f"  [bold red]✗[/bold red] {msg}")
-
-def _info(msg):
-    console.print(f"  [dim]{msg}[/dim]")
+def _step(label): console.print(f"\n[bold cyan]{label}[/bold cyan]")
+def _ok(msg):     console.print(f"  [bold green]✓[/bold green] {msg}")
+def _warn(msg):   console.print(f"  [bold yellow]⚠[/bold yellow]  {msg}")
+def _err(msg):    console.print(f"  [bold red]✗[/bold red] {msg}")
+def _info(msg):   console.print(f"  [dim]{msg}[/dim]")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 load_dotenv()
 
 EMAIL    = os.getenv("EMAIL", "")
 PASSWORD = os.getenv("PASSWORD", "")
+
+SHEET_ID   = os.getenv("SHEET_ID",   "1MPfnJ2UajI-eKKqGS4y6eb3BEgXpJiZ44nr556cfXRE")
+SHEET_NAME = os.getenv("SHEET_NAME", "Database")
+CREDS_JSON = os.getenv("CREDS_JSON", "credentials.json")
 
 STEP1_WAIT     = int(os.getenv("STEP1_WAIT",            "60"))
 STEP2_WAIT     = int(os.getenv("STEP2_WAIT",            "30"))
@@ -92,16 +79,8 @@ RENDER_TIMEOUT = int(os.getenv("STEP4_RENDER_TIMEOUT", "1200"))
 POLL_INTERVAL  = 10
 RELOAD_INTERVAL = 120
 
-CSV_FILE  = "stories.csv"
 OUT_BASE  = "output"
 OUT_SHOTS = os.path.join(OUT_BASE, "screenshots")
-
-CSV_FIELDS = [
-    "Status", "Theme", "Title", "Story",
-    "Gen_Title", "Summary", "Tags",
-    "Video_Path", "Thumb_Path", "Project_URL", "Notes",
-    "Created_Time", "Completed_Time",
-]
 
 _shutdown = False
 _browser  = None
@@ -120,28 +99,65 @@ signal.signal(signal.SIGINT, _sig)
 for _d in [OUT_BASE, OUT_SHOTS]:
     os.makedirs(_d, exist_ok=True)
 
-# ── CSV ────────────────────────────────────────────────────────────────────────
-def ensure_csv():
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
-        _warn(f"Created {CSV_FILE} — add stories and re-run.")
-        return False
-    return True
+# ── Google Sheets ──────────────────────────────────────────────────────────────
+import gspread
+from google.oauth2.service_account import Credentials
 
-def read_csv():
-    with open(CSV_FILE, "r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+_gc    = None
+_ws    = None
+_hdr   = None   # list of column names from row 1
 
-def write_csv(rows):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader(); w.writerows(rows)
+def _get_sheet():
+    global _gc, _ws, _hdr
+    if _ws is not None:
+        return _ws
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds  = Credentials.from_service_account_file(CREDS_JSON, scopes=scopes)
+    _gc    = gspread.authorize(creds)
+    sh     = _gc.open_by_key(SHEET_ID)
+    _ws    = sh.worksheet(SHEET_NAME)
+    _hdr   = _ws.row_values(1)   # header row
+    return _ws
 
-def update_row(idx, **kw):
-    rows = read_csv()
-    if 0 <= idx < len(rows):
-        rows[idx].update(kw); write_csv(rows)
+def _col(name):
+    """Return 1-based column index for header name."""
+    global _hdr
+    if name in _hdr:
+        return _hdr.index(name) + 1
+    return None
+
+def read_sheet():
+    """Return list of dicts, one per data row (skip header)."""
+    ws = _get_sheet()
+    records = ws.get_all_records(head=1)
+    return records   # each record is a dict keyed by header
+
+def update_sheet_row(sheet_row_num, **kw):
+    """
+    Update specific cells in sheet_row_num (1-based, data row = index+2).
+    kw: column_name=value pairs.
+    """
+    ws = _get_sheet()
+    for col_name, value in kw.items():
+        col_idx = _col(col_name)
+        if col_idx:
+            try:
+                ws.update_cell(sheet_row_num, col_idx, str(value) if value else "")
+            except Exception as e:
+                _warn(f"[sheet] update_cell({col_name}): {e}")
+        else:
+            # Column doesn't exist — add it
+            try:
+                global _hdr
+                new_col = len(_hdr) + 1
+                _ws.update_cell(1, new_col, col_name)
+                _hdr.append(col_name)
+                _ws.update_cell(sheet_row_num, new_col, str(value) if value else "")
+            except Exception as e:
+                _warn(f"[sheet] add_col({col_name}): {e}")
 
 def story_dir(safe_name):
     d = os.path.join(OUT_BASE, safe_name)
@@ -185,12 +201,34 @@ _CLOSE_SELECTORS = [
     '.sora2-modal-close',
     'button:has-text("Got it")',
     'button:has-text("Got It")',
-    'button:has-text("Close samples")',
     'button:has-text("Later")',
     'button:has-text("Not now")',
     'button:has-text("No thanks")',
     '.notice-bar__close',
 ]
+
+# Matches the × button on the "New Year 50% Off / Pro Privileges" popup
+_PROMO_CLOSE_JS = """\
+() => {
+    // Look for any visible × / close button NOT inside a main confirm dialog
+    const promoClose = Array.from(document.querySelectorAll(
+        '[class*="privilege-modal"] [class*="close"],' +
+        '[class*="new-year"] [class*="close"],' +
+        '[class*="promo"] [class*="close"],' +
+        '[class*="upgrade"] [class*="close"],' +
+        '.arco-modal-close-btn'
+    )).filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    });
+    if (promoClose.length) { promoClose[0].click(); return 'promo-closed'; }
+    // Fallback: any × svg button at top-right of an overlay modal
+    const svgBtns = Array.from(document.querySelectorAll(
+        '.arco-modal .arco-modal-close-btn, .arco-modal-close-btn'
+    )).filter(el => el.getBoundingClientRect().width > 0);
+    if (svgBtns.length) { svgBtns[0].click(); return 'modal-x-closed'; }
+    return null;
+}"""
 
 _POPUP_JS = """\
 () => {
@@ -212,6 +250,9 @@ _POPUP_JS = """\
 
 def _dismiss_all(page):
     for fr in _all_frames(page):
+        # Close promo/privilege popup first
+        try: fr.evaluate(_PROMO_CLOSE_JS)
+        except: pass
         try: fr.evaluate(_POPUP_JS)
         except: pass
         for sel in _CLOSE_SELECTORS:
@@ -220,8 +261,6 @@ def _dismiss_all(page):
                 if loc.count() > 0 and loc.first.is_visible():
                     loc.first.click(timeout=1000)
             except: pass
-        try: fr.keyboard.press("Escape")
-        except: pass
 
 def dismiss_popups(page, timeout=10, sweeps=3):
     for _ in range(sweeps):
@@ -229,7 +268,7 @@ def dismiss_popups(page, timeout=10, sweeps=3):
         _dismiss_all(page)
         time.sleep(0.8)
 
-# ── Animation modal / enhance dialog closer ────────────────────────────────────
+# ── Animation modal closer ─────────────────────────────────────────────────────
 _REAL_DIALOG_JS = """\
 () => {
     const masks = Array.from(document.querySelectorAll(
@@ -279,6 +318,9 @@ _ANIM_PANEL_JS = """\
 }"""
 
 def _dismiss_animation_modal(page):
+    # First try to close promo popup
+    try: page.evaluate(_PROMO_CLOSE_JS)
+    except: pass
     try:
         r = page.evaluate(_REAL_DIALOG_JS)
         if r:
@@ -310,36 +352,41 @@ def _dismiss_animation_modal(page):
     try: page.keyboard.press("Escape"); time.sleep(0.5)
     except: pass
 
-def _close_preview_popup(page):
-    js = """\
-() => {
-    let n = 0;
-    document.querySelectorAll(
-        '.arco-modal-close-btn,[aria-label="Close"],[aria-label="close"],' +
-        '[class*="modal-close"],[class*="close-btn"]'
-    ).forEach(el => {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0) { el.click(); n++; }
-    });
-    document.querySelectorAll(
-        '.arco-modal-mask,[class*="modal-mask"],[class*="overlay"]'
-    ).forEach(el => { try { el.style.display='none'; } catch(e){} });
-    return n;
-}"""
-    for _ in range(4):
-        if _shutdown: return
-        try: page.evaluate(js)
+def _handle_generated_popup(page):
+    """
+    After render: handles 'Your work ... has been generated' popup.
+    Clicks Submit (required to unlock download), waits, then clicks Download video.
+    Returns True if Download video was triggered.
+    """
+    _info("[post-render] Checking for generated popup...")
+    # Click Submit on "has been generated" modal
+    for sel in ["button:has-text('Submit')", "button.arco-btn:has-text('Submit')"]:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible(timeout=3000):
+                loc.first.click()
+                _ok("Submit clicked on generated popup")
+                sleep_log(3, "post-submit")
+                break
         except: pass
-        for sel in ['.arco-modal-close-btn', 'button[aria-label="Close"]',
-                    'button:has-text("Close")', 'button:has-text("Cancel")']:
+
+    # Now click "Download video" in header
+    for _ in range(5):
+        for sel in [
+            "button:has-text('Download video')",
+            "a:has-text('Download video')",
+            "button:has-text('Download Video')",
+            "[class*='download']:has-text('Download')",
+        ]:
             try:
                 loc = page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
-                    loc.first.click(timeout=2000)
+                    loc.first.click()
+                    _ok("Download video clicked")
+                    return True
             except: pass
-        try: page.keyboard.press("Escape")
-        except: pass
-        time.sleep(0.8)
+        time.sleep(2)
+    return False
 
 # ── DOM helpers ────────────────────────────────────────────────────────────────
 def wait_site_loaded(page, key_locator=None, timeout=60):
@@ -386,7 +433,7 @@ def dom_click_text(page, texts, timeout=60):
         if _shutdown: return False
         r = page.evaluate(js, texts)
         if r:
-            _info(f"[click] '{r}'")
+            _info(f"  '{r}'")
             return True
         time.sleep(2)
     return False
@@ -438,14 +485,8 @@ def debug_buttons(page):
 def _credit_exhausted(page):
     try:
         body = page.evaluate("() => (document.body && document.body.innerText) || ''")
-        for kw in ["insufficient credits","not enough credits","credit limit",
-                   "out of credits","credits exhausted","quota exceeded",
-                   "your credits","credits remaining"]:
-            if kw in body.lower():
-                # Check if a numeric credit balance is visible and is 0 or very low
-                pass
-        for kw in ["insufficient credits","not enough credits","out of credits",
-                   "credits exhausted","quota exceeded"]:
+        for kw in ["insufficient credits", "not enough credits", "out of credits",
+                   "credits exhausted", "quota exceeded"]:
             if kw in body.lower():
                 return True
     except: pass
@@ -453,13 +494,11 @@ def _credit_exhausted(page):
 
 # ── LOGIN ──────────────────────────────────────────────────────────────────────
 def _logout(page):
-    """Attempt to logout any existing session before fresh login."""
-    _info("[logout] Clearing session...")
+    _info("   Clearing session...")
     try:
         page.goto("https://magiclight.ai/", timeout=30000)
         wait_site_loaded(page, None, timeout=20)
         time.sleep(2)
-        # Try clicking user avatar / profile menu then logout
         page.evaluate("""\
 () => {
     const logoutTexts = ['Log out','Logout','Sign out','Sign Out','Log Out'];
@@ -474,16 +513,10 @@ def _logout(page):
 }""")
         time.sleep(1)
     except: pass
-    # Clear cookies/storage regardless
     try: page.context.clear_cookies()
     except: pass
 
-def login(page, account=None):
-    if account is None:
-        account = {"email": EMAIL, "password": PASSWORD}
-    email    = account["email"]
-    password = account["password"]
-
+def login(page):
     _step("[Login] Starting fresh login...")
     _logout(page)
 
@@ -491,14 +524,12 @@ def login(page, account=None):
     try: page.wait_for_load_state("domcontentloaded", timeout=30000)
     except: pass
     sleep_log(4, "page settle")
-
     _info(f"[Login] URL: {page.url}")
 
-    # Click "Log in with Email" tab/button if present (new UI)
+    # Click "Log in with Email" tab if present
     for sel in [
         'text=Log in with Email',
         'button:has-text("Log in with Email")',
-        'div:has-text("Log in with Email")',
         '.entry-email',
         '[class*="entry-email"]',
     ]:
@@ -520,14 +551,14 @@ def login(page, account=None):
             loc.wait_for(state="visible", timeout=6000)
             loc.scroll_into_view_if_needed()
             loc.click(); time.sleep(0.3)
-            loc.fill(email)
+            loc.fill(EMAIL)
             _info(f"[Login] Email filled via '{sel}'")
             email_filled = True; break
         except: continue
 
     if not email_filled:
         debug_buttons(page)
-        raise Exception(f"Login failed — email input not found for {email}")
+        raise Exception(f"Login failed — email input not found")
 
     time.sleep(0.4)
 
@@ -540,13 +571,13 @@ def login(page, account=None):
             loc.wait_for(state="visible", timeout=6000)
             loc.scroll_into_view_if_needed()
             loc.click(); time.sleep(0.3)
-            loc.fill(password)
+            loc.fill(PASSWORD)
             _info(f"[Login] Password filled via '{sel}'")
             pass_filled = True; break
         except: continue
 
     if not pass_filled:
-        raise Exception(f"Login failed — password input not found for {email}")
+        raise Exception("Login failed — password input not found")
 
     time.sleep(0.4)
 
@@ -559,72 +590,25 @@ def login(page, account=None):
                 el = page.locator(sel).first
                 if el.is_visible():
                     el.click(); clicked = True
-                    _info(f"[Login] Continue via '{sel}'"); break
+                    _info("[Login] Continue via '{}'".format(sel)); break
             except: pass
         if clicked: break
-        sleep_log(1, f"retry Continue {attempt+1}")
+        time.sleep(1)
 
     if not clicked:
         debug_buttons(page)
-        raise Exception(f"Login failed — Continue not found for {email}")
+        raise Exception("Login failed — Continue button not found")
 
+    # Wait for redirect to kids-story
     try:
-        page.wait_for_url(lambda u: "login" not in u.lower(), timeout=30000)
+        page.wait_for_url("**/kids-story/**", timeout=30000)
     except:
-        sleep_log(8, "redirect wait")
-
-    if "login" in page.url.lower():
-        raise Exception(f"Login failed — still on login page for {email}")
+        time.sleep(5)
 
     _ok(f"[Login] Logged in → {page.url}")
     sleep_log(3, "post-login popups")
-    _dismiss_post_login_popups(page)
-    return True
-
-
-def _dismiss_post_login_popups(page):
     _info("[Login] Dismissing post-login popups...")
-    js = """\
-() => {
-    let n = 0;
-    document.querySelectorAll(
-        'button.notice-popup-modal__close,button[aria-label="close"],' +
-        'button[aria-label="Close"],.sora2-modal-close,.arco-modal-close-btn,.notice-bar__close'
-    ).forEach(el => {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) { el.click(); n++; }
-    });
-    const texts = ["Skip","Got it","Got It","Close","Done","Later",
-                   "Not now","Maybe later","Close samples","No thanks","Dismiss"];
-    document.querySelectorAll('button,div[role="button"],a').forEach(el => {
-        const t = (el.innerText || '').trim();
-        if (texts.includes(t)) {
-            const r = el.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) { el.click(); n++; }
-        }
-    });
-    document.querySelectorAll(
-        ".arco-modal-mask,[class*='modal-mask'],.diy-tour__mask,[class*='tour-mask']"
-    ).forEach(el => { try { el.style.display = 'none'; } catch(e){} });
-    return n;
-}"""
-    for i in range(6):
-        if _shutdown: return
-        try:
-            n = page.evaluate(js)
-            if n: _info(f"  [popup] round {i+1}: {n} dismissed")
-        except: pass
-        time.sleep(1.2)
-    for sel in ["button:has-text('Skip')", "button:has-text('Close samples')",
-                "button:has-text('Got it')", "button:has-text('Got It')",
-                "button.notice-popup-modal__close", ".arco-modal-close-btn"]:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=2000); time.sleep(0.6)
-        except: pass
-    try: page.keyboard.press("Escape"); time.sleep(0.5)
-    except: pass
+    dismiss_popups(page, timeout=10, sweeps=4)
     _ok("[Login] Post-login popups cleared")
 
 
@@ -646,16 +630,14 @@ def step1(page, story_text):
     # Style — Pixar 2.0
     try:
         page.locator("div").filter(has_text=re.compile(r"^Pixar 2\.0$")).first.click()
-        _ok("Style: Pixar 2.0 selected")
-        time.sleep(0.5)
-    except: _warn("Pixar 2.0 not found — using default style")
+        _ok("Style: Pixar 2.0 selected"); time.sleep(0.5)
+    except: _warn("Pixar 2.0 not found — using default")
 
     # Aspect ratio — 16:9
     try:
         page.locator("div").filter(has_text=re.compile(r"^16:9$")).first.click()
-        _ok("Aspect: 16:9 selected")
-        time.sleep(0.5)
-    except: _warn("16:9 not found — using default ratio")
+        _ok("Aspect: 16:9 selected"); time.sleep(0.5)
+    except: _warn("16:9 not found — using default")
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     sleep_log(1)
@@ -735,7 +717,6 @@ def step2(page):
     _wait_dismissing(page, STEP2_WAIT, "characters generating")
     dismiss_popups(page, timeout=5)
 
-    # Updated: "Next Step" now at bottom-right, try multiple selectors
     clicked = False
     for sel in [
         "div[class*='step2-footer-btn-left']",
@@ -781,7 +762,7 @@ def step3(page):
     sleep_log(3)
     _set_subtitle_style(page)
 
-    # Updated: Next button moves to top-right header in Step 3
+    # Next button (top-right header in Step 3)
     clicked = False
     for sel in [
         "[class*='header'] button:has-text('Next')",
@@ -826,7 +807,7 @@ def _set_subtitle_style(page):
     _info(f"[step3] {result}")
 
 
-# ── STEP 4: Generate + Wait + Download ────────────────────────────────────────
+# ── STEP 4: Navigate to Generate → Wait → Download ────────────────────────────
 def step4(page, safe_name):
     _step("[Step 4] Navigating to Generate...")
     MAX_NEXT = 12
@@ -843,6 +824,7 @@ def step4(page, safe_name):
     return null;
 }"""
 
+    # Click "Next" in the header-shiny area to navigate forward stages
     js_header_next = """\
 () => {
     if (typeof Node === 'undefined') return null;
@@ -861,11 +843,13 @@ def step4(page, safe_name):
     return null;
 }"""
 
+    # Check for Generate/Animate (final render trigger) button
     js_has_gen = """\
 () => {
-    const texts = ["Generate","Create Video","Export","Create now","Render"];
+    const texts = ["Generate","Create Video","Export","Create now","Render","Animate"];
     const all = Array.from(document.querySelectorAll(
-        'button,div[class*="btn"],span[class*="btn"],div[class*="footer-btn"]'
+        'button,div[class*="btn"],span[class*="btn"],div[class*="footer-btn"],' +
+        'div[class*="header-shiny-action__btn"]'
     ));
     for (let i = all.length-1; i >= 0; i--) {
         const el = all[i]; let dt = '';
@@ -873,7 +857,8 @@ def step4(page, safe_name):
         const t = dt.trim() || (el.innerText || '').trim();
         if (texts.includes(t)) {
             const r = el.getBoundingClientRect();
-            if (r.width > 0) return t;
+            // Must not have "Next" sibling immediately visible at same position
+            if (r.width > 0) return t + '|||' + el.className.substring(0,60);
         }
     }
     return null;
@@ -883,10 +868,28 @@ def step4(page, safe_name):
         _dismiss_animation_modal(page)
         sleep_log(2)
 
-        found = page.evaluate(js_has_gen)
-        if found:
-            _ok(f"Generate button found after {attempt} attempts: '{found}'")
-            break
+        raw = page.evaluate(js_has_gen)
+        if raw:
+            found_text, found_cls = raw.split("|||", 1)
+            # If we see "Animate" AND there's also a visible "Next", we may be on
+            # a storyboard-animation sub-screen — only stop if no "Next" is visible
+            if found_text == "Animate":
+                # Check if there's also a "Next" button right now
+                has_next = page.evaluate("""\
+() => {
+    for (const el of Array.from(document.querySelectorAll('[class*="header-shiny-action__btn"]')))
+        if ((el.innerText||'').trim() === 'Next' && el.getBoundingClientRect().width > 0) return true;
+    return false;
+}""")
+                if has_next:
+                    # Not at generate yet — keep clicking Next
+                    pass
+                else:
+                    _ok(f"Generate/Animate button found after {attempt} attempts: '{found_text}'")
+                    break
+            else:
+                _ok(f"Generate button found after {attempt} attempts: '{found_text}'")
+                break
 
         blocking = page.evaluate(js_modal_blocking)
         if blocking:
@@ -904,7 +907,9 @@ def step4(page, safe_name):
         debug_buttons(page)
         raise Exception("Could not reach Generate button after max attempts")
 
-    if not dom_click_text(page, ["Generate", "Create Video", "Export", "Create now"], timeout=20):
+    # Click the Generate/Animate button
+    if not dom_click_text(page, ["Generate", "Create Video", "Export", "Create now", "Animate"],
+                          timeout=20):
         debug_buttons(page)
         raise Exception("Generate click failed")
 
@@ -919,6 +924,7 @@ def step4(page, safe_name):
 
     js_state = r"""
 () => {
+    // Progress bar with %
     const prog = Array.from(document.querySelectorAll(
         '[class*="progress"],[class*="Progress"],[class*="render-progress"],[class*="generating"]'
     )).filter(el => {
@@ -929,22 +935,22 @@ def step4(page, safe_name):
         const m = (prog[0].innerText || '').match(/(\d+)\s*%/);
         return 'progress:' + (m ? m[1] : '?') + '%';
     }
+    // "has been generated" popup text
     const body = (document.body && document.body.innerText) || '';
     const kws = ['video has been generated','generation complete',
-                 'successfully generated','video is ready','Export completed'];
+                 'successfully generated','video is ready','has been generated'];
     for (const k of kws)
         if (body.toLowerCase().includes(k.toLowerCase())) return 'text:' + k;
-    const vid = document.querySelector('video[src*=".mp4"],video source[src*=".mp4"]');
-    if (vid && vid.src) return 'video:' + vid.src.substring(0, 60);
+    // Download video button visible
     const btns = Array.from(document.querySelectorAll('button,a,div[class*="btn"]'));
     for (const el of btns) {
         const t = (el.innerText || '').trim();
         const r = el.getBoundingClientRect();
-        if (r.width > 0 && (t === 'Download' || t === 'Download video' || t === 'Download Video'))
+        if (r.width > 0 && (t === 'Download video' || t === 'Download Video' || t === 'Download'))
             return 'btn:' + t;
     }
-    const anc = document.querySelector('a[href*=".mp4"],a[download]');
-    if (anc && anc.offsetWidth > 0) return 'anchor';
+    const vid = document.querySelector('video[src*=".mp4"],video source[src*=".mp4"]');
+    if (vid && vid.src) return 'video:' + vid.src.substring(0, 60);
     return null;
 }"""
 
@@ -985,8 +991,9 @@ def step4(page, safe_name):
         _warn("Render timeout — attempting download anyway")
 
     sleep_log(3, "UI settle")
-    _close_preview_popup(page)
-    sleep_log(2)
+    # Handle the "has been generated" popup → click Submit → Download video
+    _handle_generated_popup(page)
+    sleep_log(3)
     return _download(page, safe_name)
 
 
@@ -995,52 +1002,29 @@ def _download(page, safe_name):
     out = {"video": "", "thumb": "", "gen_title": "", "summary": "", "tags": ""}
     sdir = story_dir(safe_name)
 
+    # Read Title/Summary/Hashtags from the previewer right panel
+    # DOM: .previewer-new-body-right-item  >  .previewer-new-body-right-item-header-title + textarea.arco-textarea
     meta = page.evaluate("""\
 () => {
-    function byLabel(label) {
-        const all = Array.from(document.querySelectorAll('div,span,label,p,h3,h4,h5'));
-        for (const el of all) {
-            const own = Array.from(el.childNodes)
-                .filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-            if (own !== label && (el.innerText || '').trim() !== label) continue;
-            if (!el.getBoundingClientRect().width) continue;
-            let c = el.parentElement;
-            for (let i = 0; i < 5; i++) {
-                if (!c) break;
-                for (const inp of c.querySelectorAll('input,textarea,[contenteditable="true"]')) {
-                    const v = (inp.value || inp.innerText || '').trim();
-                    if (v && v.length > 2) return v;
-                }
-                c = c.parentElement;
-            }
-        }
-        return '';
-    }
-    function near(lbl) {
-        for (const el of Array.from(document.querySelectorAll('*'))) {
-            if ((el.innerText || '').trim() === lbl && el.getBoundingClientRect().width > 0) {
-                const sib = el.nextElementSibling;
-                if (sib && (sib.innerText || '').trim().length > 2) return (sib.innerText || '').trim();
-                if (el.parentElement) {
-                    const kids = Array.from(el.parentElement.children);
-                    const idx = kids.indexOf(el);
-                    if (idx >= 0 && kids[idx+1]) return (kids[idx+1].innerText || '').trim();
-                }
-            }
-        }
-        return '';
-    }
-    return {
-        title:    byLabel('Title')    || near('Title')    || '',
-        summary:  byLabel('Summary')  || near('Summary')  || '',
-        hashtags: byLabel('Hashtags') || byLabel('Tags')  || near('Hashtags') || near('Tags') || '',
-    };
+    const result = { title: '', summary: '', hashtags: '' };
+    const items = document.querySelectorAll('.previewer-new-body-right-item');
+    items.forEach(item => {
+        const label = (item.querySelector('.previewer-new-body-right-item-header-title') || {}).innerText || '';
+        const ta    = item.querySelector('textarea.arco-textarea');
+        const val   = ta ? (ta.value || ta.innerText || '').trim() : '';
+        const key   = label.trim().toLowerCase();
+        if (key === 'title')    result.title    = val;
+        if (key === 'summary')  result.summary  = val;
+        if (key === 'hashtags') result.hashtags = val;
+    });
+    return result;
 }""") or {}
 
     out["gen_title"] = meta.get("title", "")
     out["summary"]   = meta.get("summary", "")
     out["tags"]      = meta.get("hashtags", "")
-    _info(f"[meta] Title='{out['gen_title'][:40]}'  Summary='{out['summary'][:40]}'")
+    _info(f"[meta] Title='{out['gen_title'][:50]}'")
+    _info(f"[meta] Summary='{out['summary'][:60]}'")
 
     cookies = {c["name"]: c["value"] for c in page.context.cookies()}
     headers = {"User-Agent": "Mozilla/5.0", "Referer": page.url}
@@ -1049,7 +1033,7 @@ def _download(page, safe_name):
     thumb_dest = os.path.join(sdir, f"{safe_name}_thumb.jpg")
     thumb_url = page.evaluate("""\
 () => {
-    // Priority 1: element near "thumbnail" / "magic thumbnail" label
+    // Priority 1: near "thumbnail" label
     const all = Array.from(document.querySelectorAll('div,span,section,h3,h4,p'));
     for (const el of all) {
         const t = (el.innerText || '').trim().toLowerCase();
@@ -1062,7 +1046,9 @@ def _download(page, safe_name):
             c = c.parentElement;
         }
     }
-    // Priority 2: largest non-icon/logo image on page
+    // Priority 2: video poster or largest image
+    const v = document.querySelector('video[poster]');
+    if (v && v.poster && v.poster.startsWith('http')) return v.poster;
     const imgs = Array.from(document.querySelectorAll('img[src]'))
         .filter(i => i.src.startsWith('http') && !i.src.includes('logo') &&
                      !i.src.includes('icon') && i.naturalWidth >= 200)
@@ -1079,7 +1065,7 @@ def _download(page, safe_name):
                 _ok(f"Thumbnail → {thumb_dest} ({len(r.content)//1024} KB)")
         except Exception as e: _warn(f"Thumbnail error: {e}")
 
-    # ── Thumbnail fallback: first timeline/storyboard image ───────────────────
+    # Thumbnail fallback: first storyboard/timeline image
     if not out["thumb"]:
         fallback_url = page.evaluate("""\
 () => {
@@ -1104,11 +1090,12 @@ def _download(page, safe_name):
                 if r.status_code == 200 and len(r.content) > 1000:
                     with open(thumb_dest, "wb") as f: f.write(r.content)
                     out["thumb"] = thumb_dest
-                    _ok(f"Thumbnail (fallback image) → {thumb_dest} ({len(r.content)//1024} KB)")
+                    _ok(f"Thumbnail (fallback) → {thumb_dest} ({len(r.content)//1024} KB)")
             except Exception as e: _warn(f"Thumbnail fallback error: {e}")
 
     # ── Video ──────────────────────────────────────────────────────────────────
     video_dest = os.path.join(sdir, f"{safe_name}.mp4")
+
     vid_url = page.evaluate("""\
 () => {
     const v = document.querySelector('video');
@@ -1139,11 +1126,18 @@ def _download(page, safe_name):
                 _warn(f"Video too small ({total}B)"); os.remove(video_dest)
         except Exception as e: _warn(f"Video download error: {e}")
 
+    # Native download button fallback
     if not out["video"]:
-        _info("[dl] Trying native download button...")
-        _close_preview_popup(page); sleep_log(2)
-        for sel in ["button:has-text('Download video')", "button:has-text('Download')",
-                    "a:has-text('Download')", "a[download]", "a[href*='.mp4']"]:
+        _info("[dl] Trying native Download video button...")
+        sleep_log(2)
+        for sel in [
+            "button:has-text('Download video')",
+            "a:has-text('Download video')",
+            "button:has-text('Download Video')",
+            "button:has-text('Download')",
+            "a[download]",
+            "a[href*='.mp4']",
+        ]:
             try:
                 loc = page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
@@ -1152,7 +1146,7 @@ def _download(page, safe_name):
                     dl_info.value.save_as(video_dest)
                     out["video"] = video_dest
                     _ok(f"Video (native download) → {video_dest}"); break
-            except Exception as e: _warn(f"{sel}: {e}")
+            except Exception as e: _warn(f"  {sel}: {e}")
 
     return out
 
@@ -1202,13 +1196,19 @@ def _retry_from_user_center(page, project_url, safe_name):
                 page.goto(project_url, timeout=60000)
                 wait_site_loaded(page, None, timeout=30)
                 sleep_log(3); _dismiss_all(page)
+                _handle_generated_popup(page)
+                sleep_log(2)
                 return _download(page, safe_name)
             except Exception as e:
                 _warn(f"Direct goto failed: {e}")
         _warn("[retry] Could not find project"); return None
 
     _ok(f"[retry] Project opened ({clicked})")
-    sleep_log(5, "project load"); wait_site_loaded(page, None, 30); _dismiss_all(page)
+    sleep_log(5, "project load")
+    wait_site_loaded(page, None, 30)
+    _dismiss_all(page)
+    _handle_generated_popup(page)
+    sleep_log(2)
     try: return _download(page, safe_name)
     except Exception as e:
         _warn(f"[retry] Download failed: {e}"); return None
@@ -1220,7 +1220,7 @@ def _make_safe(row_num, title):
     return s.strip("_")
 
 def parse_args():
-    p = argparse.ArgumentParser(description="MagicLight Auto — Kids Story Generator v2")
+    p = argparse.ArgumentParser(description="MagicLight Auto — Kids Story Generator v2.1")
     p.add_argument("--max",      type=int, default=0,  help="Max stories to process (0=all)")
     p.add_argument("--headless", action="store_true",   help="Run browser headless")
     return p.parse_args()
@@ -1231,21 +1231,28 @@ def main():
 
     console.print(Panel.fit(
         f"[bold cyan]MagicLight Auto[/bold cyan]  [dim]v{__version__}[/dim]\n"
-        f"[dim]Kids Story Video Generator[/dim]",
+        f"[dim]Kids Story Video Generator — Google Sheets Edition[/dim]",
         border_style="cyan"
     ))
 
     if not EMAIL or not PASSWORD:
         _err("No credentials. Set EMAIL + PASSWORD in .env"); return
 
-    if not ensure_csv(): return
+    if not os.path.exists(CREDS_JSON):
+        _err(f"credentials.json not found at: {CREDS_JSON}"); return
 
-    rows    = read_csv()
-    pending = [(i, r) for i, r in enumerate(rows)
-               if r.get("Status", "").strip().lower() == "pending"]
+    # Load sheet
+    _ok(f"Connecting to Google Sheet: [bold]{SHEET_NAME}[/bold]...")
+    try:
+        records = read_sheet()
+    except Exception as e:
+        _err(f"Sheet error: {e}"); return
+
+    pending = [(i, r) for i, r in enumerate(records)
+               if str(r.get("Status", "")).strip().lower() == "pending"]
 
     if not pending:
-        _warn("No Pending rows in stories.csv."); return
+        _warn("No 'Pending' rows found in Sheet."); return
 
     limit   = args.max if args.max > 0 else len(pending)
     pending = pending[:limit]
@@ -1257,22 +1264,21 @@ def main():
         context = browser.new_context(accept_downloads=True, no_viewport=True)
         page    = context.new_page()
 
-        # Always do a fresh login (logout first)
         try:
             login(page)
         except Exception as e:
             _err(f"[FATAL] Login failed: {e}")
             browser.close(); return
 
-        for csv_idx, row in pending:
+        for rec_idx, row in pending:
             if _shutdown: break
 
-            story = row.get("Story", "").strip()
+            story = str(row.get("Story", "")).strip()
             if not story:
-                _warn(f"Row {csv_idx+2}: empty Story — skipping"); continue
+                _warn(f"Row {rec_idx+2}: empty Story — skipping"); continue
 
-            title   = row.get("Title", f"Row{csv_idx+2}").strip() or f"Row{csv_idx+2}"
-            row_num = csv_idx + 2
+            title   = str(row.get("Title", f"Row{rec_idx+2}")).strip() or f"Row{rec_idx+2}"
+            row_num = rec_idx + 2          # sheet row (1=header, 2=first data)
             safe    = _make_safe(row_num, title)
 
             console.print(Rule(style="cyan"))
@@ -1281,8 +1287,9 @@ def main():
                 border_style="cyan", expand=False
             ))
 
-            update_row(csv_idx, Status="Processing",
-                       Created_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            update_sheet_row(row_num,
+                Status       = "Processing",
+                Created_Time = datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             project_url = ""
             result = None
@@ -1292,30 +1299,30 @@ def main():
 
                 if _credit_exhausted(page):
                     _err("[Low Credit] Insufficient credits — stopping")
-                    update_row(csv_idx, Status="Low Credit",
-                               Notes="Credits exhausted before Step 2",
-                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    update_sheet_row(row_num, Status="Low Credit",
+                                     Notes="Credits exhausted before Step 2",
+                                     Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     break
 
                 step2(page)
                 step3(page)
                 project_url = page.url
-                update_row(csv_idx, Project_URL=project_url)
+                update_sheet_row(row_num, Project_URL=project_url)
 
                 if _credit_exhausted(page):
                     _err("[Low Credit] Insufficient credits — stopping")
-                    update_row(csv_idx, Status="Low Credit",
-                               Notes="Credits exhausted before Step 4",
-                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    update_sheet_row(row_num, Status="Low Credit",
+                                     Notes="Credits exhausted before Step 4",
+                                     Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     break
 
                 result = step4(page, safe)
 
                 if _credit_exhausted(page):
                     _err("[Low Credit] Insufficient credits detected post-render")
-                    update_row(csv_idx, Status="Low Credit",
-                               Notes="Credits exhausted",
-                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    update_sheet_row(row_num, Status="Low Credit",
+                                     Notes="Credits exhausted",
+                                     Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     break
 
             except Exception as e:
@@ -1324,10 +1331,10 @@ def main():
                 _err(f"Row {row_num} error: {e}")
 
                 if _credit_exhausted(page):
-                    _err("[Low Credit] Insufficient credits — stopping all processing")
-                    update_row(csv_idx, Status="Low Credit",
-                               Notes="Credits exhausted",
-                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    _err("[Low Credit] Stopping all processing")
+                    update_sheet_row(row_num, Status="Low Credit",
+                                     Notes="Credits exhausted",
+                                     Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     break
 
                 _info("[retry] Attempting via User Center...")
@@ -1336,14 +1343,14 @@ def main():
                     _warn(f"[retry] {re_err}"); result = None
 
                 if not result:
-                    update_row(csv_idx, Status="Error", Notes=str(e)[:300],
-                               Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    update_sheet_row(row_num, Status="Error", Notes=str(e)[:300],
+                                     Completed_Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     _err(f"Row {row_num} → Error")
                     sleep_log(5); continue
 
             video_ok = bool(result and result.get("video") and os.path.exists(result["video"]))
             status   = "Done" if video_ok else "No_Video"
-            update_row(csv_idx,
+            update_sheet_row(row_num,
                 Status         = status,
                 Gen_Title      = (result or {}).get("gen_title") or title,
                 Summary        = (result or {}).get("summary", ""),
@@ -1368,6 +1375,6 @@ def main():
         except: pass
         _browser = None
 
+
 if __name__ == "__main__":
     main()
-
