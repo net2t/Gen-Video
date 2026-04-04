@@ -146,22 +146,39 @@ def check_ffmpeg():
 
 def get_ffmpeg_args(input_file: Path, output_file: Path, profile: str, trim_seconds: int, logo_path: Path, logo_x: int, logo_y: int, logo_width: int, logo_opacity: float, endscreen: bool, endscreen_video: Path | None) -> list[str]:
     args = ["ffmpeg", "-y", "-i", str(input_file)]
-    # Trim
+    # Trim by duration (calculate video duration first)
     if trim_seconds > 0:
-        args.extend(["-t", str(input_file.stat().st_size - trim_seconds)])
+        # Get video duration
+        try:
+            result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)], capture_output=True, text=True, check=True)
+            duration = float(result.stdout.strip())
+            if duration > trim_seconds:
+                args.extend(["-t", str(duration - trim_seconds)])
+        except Exception:
+            pass  # If we can't get duration, skip trimming
+    # Build filter graph
+    filters = []
     # Logo overlay
     if logo_path.exists():
-        args.extend(["-i", str(logo_path), "-filter_complex", f"[0:v][1:v] overlay={logo_x}:{logo_y}:format=auto,format=yuv420p"])
+        args.extend(["-i", str(logo_path)])
+        filters.append(f"[0:v][1:v] overlay={logo_x}:{logo_y}:format=auto")
     # Profile scaling
-    if profile == "480":
-        args.extend(["-vf", "scale=854:480"])
-    elif profile == "720":
-        args.extend(["-vf", "scale=1280:720"])
-    elif profile == "1080":
-        args.extend(["-vf", "scale=1920:1080"])
+    scale_map = {"480": "854:480", "720": "1280:720", "1080": "1920:1080"}
+    if profile in scale_map:
+        filters.append(f"scale={scale_map[profile]}")
     # Endscreen
     if endscreen and endscreen_video and endscreen_video.exists():
-        args.extend(["-i", str(endscreen_video), "-filter_complex", f"[0:v][1:v] overlay={logo_x}:{logo_y}:format=auto,format=yuv420p;[v]concat=n=2:v=1:a=0"])
+        args.extend(["-i", str(endscreen_video)])
+        # Determine input labels
+        video_inputs = 2 if logo_path.exists() else 1
+        endscreen_label = f"[{video_inputs}:v]"
+        if filters:
+            filters[-1] += f"[v];{endscreen_label}[v] concat=n=2:v=1:a=0"
+        else:
+            filters.append(f"[0:v]{endscreen_label} concat=n=2:v=1:a=0")
+    # Apply filters
+    if filters:
+        args.extend(["-filter_complex", ",".join(filters), "-pix_fmt", "yuv420p"])
     # Output
     args.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output_file)])
     return args
